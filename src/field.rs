@@ -47,6 +47,19 @@ impl From<&Field> for u64 {
     }
 }
 
+impl From<&Field> for [u8; 8] {
+    fn from(value: &Field) -> [u8; 8] {
+        value.v.to_le_bytes()
+    }
+}
+
+impl From<[u8; 8]> for Field {
+    fn from(value: [u8; 8]) -> Field {
+        let n = u64::from_le_bytes(value.try_into().expect("Hash can't be masked"));
+        Field { v: n % P }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +125,15 @@ mod tests {
         assert_eq!(u64::from(&Field::from(P - 1)), P - 1);
         assert_eq!(u64::from(&Field::from(P)), 0);
         assert_eq!(u64::from(&Field::from(P + 1)), 1);
+    }
+
+    #[test]
+    fn from_bytes() {
+        type T = [u8; 8];
+        assert_eq!(T::from(&Field::from(0)), [0x00; 8]);
+        assert_eq!(T::from(&Field::from(3)), 3u64.to_le_bytes());
+        assert_eq!(T::from(&Field::from(P - 1)), (P - 1).to_le_bytes());
+        assert_eq!(T::from(&Field::from(P)), [0x00; 8]);
+        assert_eq!(T::from(&Field::from(P + 1)), 1u64.to_le_bytes());
     }
 }

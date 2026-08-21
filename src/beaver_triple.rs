@@ -3,9 +3,9 @@ use crate::gilboa;
 use crate::node_connection::NodeNetwork;
 
 pub struct BeaverTripleShare {
-    a_share: Field,
-    b_share: Field,
-    c_share: Field,
+    pub a_share: Field,
+    pub b_share: Field,
+    pub c_share: Field,
 }
 
 pub fn beaver_triple(net: &NodeNetwork) -> BeaverTripleShare {

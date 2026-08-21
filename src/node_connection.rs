@@ -12,7 +12,7 @@ const NODE_ADDR: [(NodeId, &str); NODE_NUM] = [
 ];
 
 pub struct NodeNetwork {
-    self_id: NodeId,
+    pub self_id: NodeId,
     stream_read: HashMap<NodeId, TcpStream>,
     stream_write: HashMap<NodeId, TcpStream>,
 }
