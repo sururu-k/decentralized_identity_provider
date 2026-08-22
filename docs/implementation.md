@@ -232,7 +232,7 @@ t-of-n が与えるのは **どの quorum を選ぶかの自由** であって�
 
 ## 未実装
 
-[design-discussion.md](./design-discussion.md) の論点のうち、手つかずのもの。
+論点のうち、手つかずのもの。全体の到達度は [status.md](./status.md) を参照。
 
 - **論点G: リフレッシュトークン** — 設計は決まった（[refresh-token.md](./refresh-token.md)）。
   OAuth を壊さず実装できる見込み。実装はこれから
