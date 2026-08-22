@@ -312,18 +312,21 @@ PESTO の proactive secret sharing。Issue でも「一番最後に考えたほ�
 
 | 締切 | 投稿先 | 形式 | 備考 |
 |:--|:--|:--|:--|
-| 2026/8/24 | CSS2026 デモ/ポスター | 申込のみ | 原稿不要。浜松で対面必須 |
-| 2026/8/26 (早期) / 9/14 | NIST WPEC 2026 | トーク提案 | MPC がスコープ。オンライン。査読ではなく curated |
+| 2026/8/26 (早期) / 9/14 | NIST WPEC 2026 | トーク提案 | 非アーカイブ・オンライン。MPC がスコープ。投稿コスト最小 |
 | **2026/9/4** | **IEICE ISEC 研究会** | 和文8p・査読なし | 11/19-20 兵庫。**IEICE 会員限定** |
 | 2026/9/8 | IEICE ICSS 研究会 | 和文8p・査読なし | 11/17-18 大津 |
+| 2026/9/11 | SPACE 2026 Cycle 2 | LNCS 20p・査読あり | **PAS-TA-U の掲載先**。系譜的に自然 |
 | **2026/9/15** | **SSR 2026** | LNCS 23p・査読あり | **Vision トラックが work-in-progress を明示受理**。12/13-15 ボルチモア |
-| 2026/9/17 | FC 2027 本会議 | Short 8p・査読あり | Short を "work in progress" と定義。identity management がスコープ |
-| 2026/9/24 | ACNS 2027 Cycle 1 | LNCS 20p・査読あり | identity management / authentication がスコープ |
-| 2026/10/15 ⚠️ | RWC 2027 | 3p アブスト | **非アーカイブ**。「理論のみは採択しにくい」と明記。締切は要照会 |
+| 2026/9/17 | FC 2027 本会議 | Short 8p・査読あり | Short を "work in progress" と定義 |
+| 2026/9/24 | ACNS 2027 Cycle 1 | LNCS 20p・採択率 ~23% | CFP が implementation / deployment / performance を明示列挙。⚠️ **C1 で落ちると C2 に再投稿不可** |
+| **2026/10/15** ⚠️ | **RWC 2027** | 3p アブスト | **非アーカイブ＝他会議と併走可**。「理論のみは採択しにくい」と明記。締切は要照会 |
+| 2026/10/22 | CT-RSA 2027 | LNCS・採択率 ~35% | 暗号系で最も通しやすい部類。SoK 枠は新規性を要件としない |
 | 2026/11/3-5 | IIW #43 | 登録のみ | アンカンファレンス。設計フィードバック用 |
+| 2026/11/20 ⚠️ | EuroS&P 2027 | IEEE 13p | **PESTO の掲載先**。日程情報が前年の流用の疑いあり、要再確認 |
 | 2026/12月中旬 | SCIS2027 | 和文8p・査読なし | 2027/1 広島（日程は**非公式情報**） |
-| 2027年春（見込み） | OAuth Security Workshop | トーク | **IETF OAuth WG と学術の交流の場。最も当事者に近い** |
-| 2027/3月頃（見込み） | SeRIM（EuroS&P 併設） | **Tool paper 4p** 枠あり | ID管理特化の唯一のWS。CFP は2026年12月頃 |
+| 2027/3月頃（見込み） | SeRIM（EuroS&P 併設） | **Tool paper 4p** 枠 | ID管理特化の現存唯一のWS。CFP は2026年12月頃 |
+| 2027/5月頃（見込み） | OAuth Security Workshop | トーク | IETF OAuth WG と学術の交流の場 |
+| **2027/6月頃（見込み）** | **IWSEC 2027** | LNCS 16p・採択率 28% | 日本開催。CFP が **implementation experiences を明示募集**。Best Student Paper あり |
 
 ### 出すなら何を主題にするか
 
@@ -336,6 +339,25 @@ RFC 9700 §4.14 は再利用検知 → セッション失効を要求するが�
 **標準化研究が主題の SSR とは相性が良い**。
 ただし quorum intersection 自体は Byzantine quorum systems の標準技法なので、
 新しいのは適用先である点は正直に書く。
+
+### トップ会議（CCS / USENIX / NDSS / S&P）には現状届かない
+
+採択率 14〜17%。現状の完成度では見込みは 5% 未満。足りないものは優先度順に:
+
+1. **形式的な安全性定義と証明** — PASTA も PESTO も「定義を作って証明した」ことが貢献の本体。
+   refresh を含むよう拡張した PbTA の定義と game-based 証明が要る。
+   **これが大規模評価より優先**（査読者プールが PASTA/PESTO 系譜の暗号研究者のため）
+2. **評価** — n を振ったスケーリング、LAN/WAN、集権 IdP とのベースライン比較、
+   主要 JWT ライブラリ 5〜10 種での相互運用実証
+3. **Artifact** — CCS / USENIX / S&P / AsiaCCS / EuroS&P はいずれも
+   open science / artifact が**必須**。Rust の PoC があるのは強みなので、
+   **匿名化した公開リポジトリの準備は今から進める**
+
+### IACR ePrint の注意
+
+全会議が preprint を許容している（IACR 自身が「ペナルティを受けるべきではない」と明記）。
+ただし **一度登録すると全バージョンが永久に残り、撤回しても消せない**。
+未熟な版を出すと後々まで残るので、**投稿版が固まってから登録する**。
 
 ---
 
