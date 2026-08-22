@@ -9,6 +9,7 @@
 | [prior-art.md](./prior-art.md) | **先行研究 (PASTA / PESTO) の調査**。設計方針が変わった |
 | [implementation.md](./implementation.md) | **動く PoC**。3 ノード t=2 で JWT 発行まで通る |
 | [status.md](./status.md) | **進捗と残論点**。どこまで作ったか / 何が残っているか |
+| [refresh-token.md](./refresh-token.md) | **論点G**。OAuth を壊さずリフレッシュを実装できるかの調査 |
 
 ## 何を解こうとしているか
 
