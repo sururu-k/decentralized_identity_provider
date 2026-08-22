@@ -5,6 +5,168 @@
 
 ---
 
+## 図解
+
+### 方針の変化 — 議論での到達点 → PASTA
+
+```mermaid
+graph LR
+    subgraph Before["議論での到達点"]
+        direction TB
+        b1["サーバがパスワードを検証"]
+        b2["検証が通ったら署名シェアを出す"]
+        b3["MPC 回路で束縛<br>z_i にマスク d·r を加算"]
+        b1 --> b2 --> b3
+    end
+
+    subgraph After["PASTA（今回採用）"]
+        direction TB
+        a1["サーバは検証しない"]
+        a2["署名シェアを無条件に生成し<br>h_i で暗号化して返す"]
+        a3["クライアントが復号できるか<br>= 認証の成否"]
+        a1 --> a2 --> a3
+    end
+
+    Before ==>|"4ラウンド → 2ラウンド<br>MPC 回路が不要に<br>Beaver triple の出番が消えた"| After
+```
+
+### 到達度 — 何ができて何が残っているか
+
+```mermaid
+graph TB
+    subgraph Done["✅ 実装済み・テスト済み"]
+        direction LR
+        d1["認証<br>2HashTDH 閾値 OPRF"]
+        d2["認証と署名の束縛<br>PASTA 暗号化方式"]
+        d3["閾値署名<br>FROST → 標準 Ed25519"]
+        d4["決定的な JWT<br>alg: EdDSA"]
+    end
+
+    subgraph Half["🔺 途中まで"]
+        direction LR
+        h1["DPoP 束縛<br>cnf.jkt を入れるまで<br>証明の検証は未実装"]
+        h2["レート制限<br>構造は得た<br>試行回数の制限は未実装"]
+    end
+
+    subgraph Todo["❌ 未着手"]
+        direction LR
+        t1["ゲートウェイ<br>OAuth / ネットワーク層"]
+        t2["DKG<br>今は trusted dealer"]
+        t3["結託耐性<br>PESTO の PSS"]
+    end
+
+    subgraph Open["🚨 未解決 — 要議論"]
+        direction LR
+        o1["リフレッシュトークン"]
+        o2["アカウント回復"]
+    end
+
+    Done --> Half --> Todo
+    Open -.->|"設計をひっくり返す可能性"| Done
+```
+
+### OAuth / OIDC の形式は保つ
+
+**RP から見える形式は標準の OIDC のまま変えない。** 分散はゲートウェイの内側に隠す。
+Issue の「受け渡すパラメータは変えず、既存の集権的 IdP をそのまま置き換える」という前提。
+
+```mermaid
+graph LR
+    RP(["RP<br>（既存のサービス）"])
+
+    subgraph Standard["RP から見える範囲 — 標準の OIDC のまま"]
+        direction TB
+        e1["/.well-known/openid-configuration"]
+        e2["/authorize<br>client_id, redirect_uri,<br>response_type, scope, state"]
+        e3["/token<br>grant_type, code"]
+        e4["/jwks.json<br>グループ公開鍵 1 本"]
+        e5["アクセストークン<br>alg: EdDSA の JWT"]
+    end
+
+    subgraph Hidden["この内側に分散が隠れる"]
+        direction TB
+        gw["ゲートウェイ<br>暗号学的に無権限<br>掌握されても署名は出せない"]
+        n1["Node 1"]
+        n2["Node 2"]
+        n3["Node 3"]
+        gw --- n1
+        gw --- n2
+        gw --- n3
+    end
+
+    RP <-->|"パラメータは一切変えない"| Standard
+    Standard --> Hidden
+    e5 -.->|"閾値署名であることを<br>RP は知らなくてよい"| RP
+```
+
+| RP から見えるもの | 状態 |
+|:--|:--|
+| **アクセストークン（`alg: EdDSA` の JWT）** | ✅ **実装済**。標準の Ed25519 検証器で通ることを確認済み |
+| `/.well-known/openid-configuration` | ❌ 未実装 |
+| `/authorize`（client_id, redirect_uri, response_type, scope, state） | ❌ 未実装 |
+| `/token`（grant_type, code） | ❌ 未実装 |
+| `/jwks.json`（グループ公開鍵 1 本） | ❌ 未実装 |
+
+**いちばん互換性が問われる「トークンそのもの」は既に標準形式で出せている。**
+クレームも `iss` / `sub` / `aud` / `iat` / `exp` / `jti` / `cnf` と標準のものだけで構成してある。
+残っているのはエンドポイントの実装で、これは論点E（ゲートウェイ）に含まれる。
+
+> ⚠️ 唯一標準から外れうるのが **論点G（リフレッシュトークン）**。
+> OAuth の `grant_type=refresh_token` を素直に実装すると束縛原則と衝突するので、
+> 「形式を保つ」ことと「なりすまし耐性」がここで正面からぶつかる。
+
+### 塞いだなりすまし経路
+
+テスト 28 本が、それぞれどの攻撃経路に対応しているか。
+
+```mermaid
+graph LR
+    A(["なりすましを狙う攻撃者"])
+
+    A --> P1["署名鍵を盗む"]
+    A --> P2["認証を飛ばして<br>署名だけ要求する"]
+    A --> P3["ノードを 1 台掌握する"]
+    A --> P4["sub を他人に<br>差し替える"]
+    A --> P5["署名シェアを<br>別セッションに流用"]
+    A --> P6["発行済みトークンを盗む"]
+
+    P1 --> R1["どこにも鍵が揃っていない<br>閾値署名 t-of-n"]
+    P2 --> R2["復号できない<br>PASTA の束縛"]
+    P3 --> R3["他ノードの h_j が手に入らない<br>h は誰にも渡らない"]
+    P4 --> R4["各ノードが自分のレコードから<br>ペイロードを構築する"]
+    P5 --> R5["AEAD の AAD に<br>署名対象を入れてある"]
+    P6 --> R6["DPoP 束縛<br>cnf.jkt"]
+
+    R1 --> OK(["✅ 全経路をテストで実証"])
+    R2 --> OK
+    R3 --> OK
+    R4 --> OK
+    R5 --> OK
+    R6 --> OK
+```
+
+### 残論点の依存関係と優先順位
+
+```mermaid
+graph TD
+    Now(["現在地<br>3 ノード t=2 で JWT 発行まで動く"])
+
+    Now --> G["🚨 リフレッシュトークン<br>『パスワード無しで再発行』が<br>束縛原則と正面衝突する"]
+    Now --> H["🚨 アカウント回復<br>『運営に問い合わせ』窓口が<br>構造的に存在しない"]
+
+    G --> Decide{"設計の方向が決まる"}
+    H --> Decide
+
+    Decide --> DKG["DKG を実装<br>trusted dealer を外す"]
+    DKG --> Net["ネットワーク層<br>+ OAuth ゲートウェイ"]
+    Net --> RP(["RP から実際に叩ける形になる"])
+    RP --> PSS["PESTO の<br>proactive secret sharing"]
+
+    G -.->|"どちらも PASTA/PESTO が<br>扱っていない"| H
+```
+
+---
+
 ## 今回できたこと
 
 ### 1. 先行研究が見つかった（方針が変わった）
