@@ -109,6 +109,23 @@ Issue で「結託耐性は最後に考えたほうがいい」としていた�
 
 ---
 
+### ⚠️ PESTO は既に「標準 JWT で OAuth 互換」をやっている
+
+本文を精読して分かった重要な点。**PESTO は我々が新規性だと思っていた部分を既に実装済み**だった。
+
+> We use our protocol to construct **standard RSA-signed JWTs, i.e., they can be verified by any
+> service provider that accepts such tokens in an OAuth or OIDC authentication flow.**
+> Our implementation utilizes REST and TLS in order to give a realistic benchmark on a real-world deployment.
+
+さらに要旨に「realizing **OAuth-compatible bearer tokens** for SSO」、
+本文に「compatible with existing authentication standards such as OAuth and OIDC」とある。
+
+つまり **「閾値署名で標準 JWT を作り、RP を無改造のまま使える」は 2020 年に実証済み**。
+我々の実装との差は **RSA → Ed25519 (FROST)** という ciphersuite の違いだけで、貢献にはならない。
+
+なお PESTO 本文で 71 回出てくる "refresh" は **秘密鍵シェアの proactive re-share** の意味であり、
+**OAuth のリフレッシュトークンではない**。そちらは PESTO も扱っていない。
+
 ## 3. 隣接プロダクトとの違い（重要）
 
 Issue のコメントで zkLogin / Web3Auth 系が挙がったが、**解いている問題の層が違う**。
