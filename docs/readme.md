@@ -8,6 +8,7 @@
 | [prior-art.md](./prior-art.md) | 先行研究 (PASTA / PESTO) の調査 |
 | [implementation.md](./implementation.md) | PoC の実装解説 |
 | [refresh-token.md](./refresh-token.md) | 論点G。OAuth を壊さずリフレッシュを実装できるか |
+| [whiteboard-gaps.md](./whiteboard-gaps.md) | 8/22 板書の構成と、**まだ塞がっていない穴**（火 8/25 期限） |
 
 ## 何を解こうとしているか
 
