@@ -44,6 +44,26 @@ sequenceDiagram
     RP->>RP: 12. 標準 Ed25519 署名検証および cnf.jkt の確認
 ```
 
+### サーバー構成（コンポーネント配置）
+
+```mermaid
+graph TB
+    Browser["ブラウザ (Client SDK)<br>DPoP 鍵生成・ブラインド暗号化・署名集約"]
+    RP["RP (クライアント Web サービス)<br>redirect_uri で id_token 受信<br>JWKS で Ed25519 検証"]
+    Proxy["OAuth プロキシ / Gateway<br>/.well-known  /jwks.json<br>/authorize  /api/pasta/sign-on<br>/api/pasta/refresh"]
+    N1["ノード 1<br>TOPRF 部分評価 B_1<br>FROST 署名シェア z_1<br>ChaCha20-Poly1305 暗号化"]
+    N2["ノード 2<br>TOPRF 部分評価 B_2<br>FROST 署名シェア z_2<br>ChaCha20-Poly1305 暗号化"]
+    N3["ノード 3<br>TOPRF 部分評価 B_3<br>FROST 署名シェア z_3<br>ChaCha20-Poly1305 暗号化"]
+
+    RP -->|"認可要求リダイレクト<br>/authorize"| Browser
+    Browser -->|"ブラインド値 A, cnf.jkt<br>/api/pasta/sign-on"| Proxy
+    Proxy -->|"ブラインド値 A をブロードキャスト"| N1 & N2 & N3
+    N1 & N2 & N3 -->|"暗号化応答 (B_i, ct_i)"| Proxy
+    Proxy -->|"暗号文のまま中継"| Browser
+    Browser -->|"id_token を form_post<br>（プロキシ経由なし）"| RP
+    RP -->|"/jwks.json 取得"| Proxy
+```
+
 ---
 
 ## 2. 「プロキシが Token を持たない」の成立メカニズム
