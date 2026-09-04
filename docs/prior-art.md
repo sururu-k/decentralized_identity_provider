@@ -18,7 +18,7 @@
 > secret key. **The authentication server(s) are single point of failures that if breached, enable attackers
 > to forge arbitrary tokens or mount offline dictionary attacks to recover client credentials.**
 
-Issue の問題意識（なりすまし = トークン偽造）と一字一句同じ。
+当初の問題意識（なりすまし = トークン偽造）と一字一句同じ。
 PASTA は **PbTA (Password-based Threshold Authentication)** という概念を定式化し、
 IdP の役割を n サーバに分散、任意の t サーバが協力すればパスワード検証とトークン発行ができ、
 t−1 サーバでは **トークン偽造もオフライン辞書攻撃も不可能** という枠組みを与えた。
@@ -30,7 +30,7 @@ t−1 サーバでは **トークン偽造もオフライン辞書攻撃も不�
 
 ### PASTA の解き方は、私たちの議論と違う
 
-Issue では「認証と署名をひとつの MPC 回路として束縛する」方向で議論していた。
+以前の検討では「認証と署名をひとつの MPC 回路として束縛する」方向で議論していた。
 PASTA の答えはもっと軽い。論文の技術概要から:
 
 > We resolve this deadlock by observing that **the check does not have to be done on the server side.**
@@ -102,14 +102,14 @@ PASTA を改良し、**proactive security** と **adaptive security** を追加�
 
 - **全サーバが同時に侵害されない限り安全** — 順次侵害されても、鍵を再シェアすることで
   過去に漏れた情報を無効化できる
-- Issue の「スコープ外」に挙げていた **Proactive Secret Sharing** が、
+- 当初の「スコープ外」に挙げていた **Proactive Secret Sharing** が、
   ここでは中心的な機構として組み込まれている
 
-Issue で「結託耐性は最後に考えたほうがいい」としていた論点に、既に答えがある。
+議論の初期に「結託耐性は最後に考えたほうがいい」としていた論点に、既に答えがある。
 
 ---
 
-### ⚠️ PESTO は既に「標準 JWT で OAuth 互換」をやっている
+### [重要] PESTO は既に「標準 JWT で OAuth 互換」をやっている
 
 本文を精読して分かった重要な点。**PESTO は我々が新規性だと思っていた部分を既に実装済み**だった。
 
@@ -133,7 +133,7 @@ PESTO が示したのは **RP がトークンを検証できる**こと。
 
 | | PESTO | 残っている問い |
 |:--|:--|:--|
-| トークン形式 | ✅ 標準 JWT | — |
+| トークン形式 | 標準 JWT 対応 | — |
 | `/authorize` `/token` `/jwks` `/.well-known` | 記述なし | **エンドポイントを保てるか** |
 | 接続先の数 | クライアントが n 台と直接話す | **単一 URL に畳めるか** |
 | リダイレクト、`state` / `nonce` / grant type | 記述なし | **既存 RP を無改造で通せるか** |
@@ -145,20 +145,20 @@ PESTO の暗号側の主張とは重なっていない。ここが残ってい�
 
 ## 3. 隣接プロダクトとの違い（重要）
 
-Issue のコメントで zkLogin / Web3Auth 系が挙がったが、**解いている問題の層が違う**。
+検討過程のコメントで zkLogin / Web3Auth 系が挙がったが、**解いている問題の層が違う**。
 
 | | 何をしているか | なりすまし問題を解くか |
 |:--|:--|:--|
-| **zkLogin (Sui)** | OAuth の `id_token` を ZKP でブロックチェーンアドレスに紐付け | ❌ OAuth プロバイダを**信頼する前提**。IdP が偽 `id_token` を出せば終わり |
-| **Web3Auth / tKey** | OAuth ログイン結果を鍵シェアに変換、Shamir + TSS で分散管理 | ❌ 同上。`idToken` を Auth Network に渡す構造なので、IdP は依然として信頼点 |
-| **Lit Protocol** | 閾値ネットワークで PKP を管理 | △ 鍵管理は分散だが、認証入力は外部 IdP |
-| **PASTA / PESTO** | **IdP そのものを分散する** | ✅ これが Issue のテーマ |
+| **zkLogin (Sui)** | OAuth の `id_token` を ZKP でブロックチェーンアドレスに紐付け | 不可。OAuth プロバイダを**信頼する前提**。IdP が偽 `id_token` を出せば終わり |
+| **Web3Auth / tKey** | OAuth ログイン結果を鍵シェアに変換、Shamir + TSS で分散管理 | 不可。同上。`idToken` を Auth Network に渡す構造なので、IdP は依然として信頼点 |
+| **Lit Protocol** | 閾値ネットワークで PKP を管理 | 部分的。鍵管理は分散だが、認証入力は外部 IdP |
+| **PASTA / PESTO** | **IdP そのものを分散する** | 解決。これが本プロジェクトのテーマ |
 
 Web3Auth の既定構成は Auth Network 3/5、ユーザーデバイス側 2/3 の閾値。
 分散鍵管理の実運用パラメータとして参考になるが、**OAuth を信頼された入力として受け取っている**点で、
 私たちが解こうとしている問題の外側にいる。
 
-Takumi さんの Issue でのコメント（「OAuth の結果を web3 アカウントに繋げようというものに見えた」）は正しい。
+Takumi さんのコメント（「OAuth の結果を web3 アカウントに繋げようというものに見えた」）は正しい。
 
 ---
 
@@ -173,7 +173,7 @@ Takumi さんの Issue でのコメント（「OAuth の結果を web3 アカウ
 | `opaque-ke` | 4.0.1 | 568k | OPAQUE PAKE (facebook) |
 | `jsonwebtoken` | 11.0.0 | 173M | JWT |
 
-### ⚠ 依存バージョンの衝突を発見
+### [注意] 依存バージョンの衝突を発見
 
 本リポジトリと `frost-ed25519 3.0.0` の依存は噛み合わない。
 
@@ -209,7 +209,7 @@ PASTA が TTG として実装したのは **ブロック暗号 MAC / DDH-MAC / �
   そのままでは PASTA の2ラウンドに収まらない。ただし **FROST は round1 の前処理が可能**なので、
   コミットメントを事前に配っておけば sign-on 自体は2ラウンドで回る
 
-Issue の目標が「既存の集権的 IdP をそのまま置き換える」である以上、
+本プロジェクトの目標が「既存の集権的 IdP をそのまま置き換える」である以上、
 **RP 互換性を取って FROST + EdDSA、round1 は前処理**、が妥当な選択と考える。
 
 ---
