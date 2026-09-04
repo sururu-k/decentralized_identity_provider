@@ -1,18 +1,24 @@
 import crypto from "node:crypto";
+import { ristretto255 } from "@noble/curves/ed25519";
 import {
   FrostCommitment,
   FrostNonces,
   computeSignatureShare,
   generateFrostNonces,
 } from "../crypto/frost.js";
+import { deriveRefreshKey } from "../crypto/kdf.js";
+import { aeadEncrypt, deriveAeadNonce } from "../crypto/aead.js";
+import { Share } from "../crypto/shamir.js";
 import {
-  EncryptedPayload,
-  deriveNodeKey,
-  deriveRefreshKey,
-  encryptAead,
-} from "../crypto/kdf.js";
+  blind,
+  deriveServerKey,
+  evaluate,
+  finalize,
+  generateToprfKey,
+  unblind,
+} from "../crypto/toprf.js";
 import { verifyDPoPProof } from "../client-sdk/dpop.js";
-import { base64UrlEncode, createSigningInput } from "../jwt/jwt.js";
+import { base64UrlDecode, base64UrlEncode, createSigningInput } from "../jwt/jwt.js";
 
 export interface NodeSessionRecord {
   sessionId: string;
@@ -26,12 +32,15 @@ export interface NodeSessionRecord {
 export interface UserRecord {
   sub: string;
   username: string;
+  toprfKeyShare: Share; // Share of TOPRF key
   h_i: Uint8Array; // pre-computed / TOPRF derived key for node i
 }
 
 export interface SignOnRequest {
   sessionId: string;
   username: string;
+  blinded: string; // base64url of Ristretto255 point A = r * H1(password)
+  sessionNonce: string; // base64url of 16-byte random session nonce
   cnfJkt: string;
   nonce?: string;
   iat: number;
@@ -45,7 +54,8 @@ export interface SignOnRequest {
 export interface SignOnResponse {
   nodeId: number;
   commitment: { D: Uint8Array; E: Uint8Array };
-  ct_i: EncryptedPayload;
+  toprfPartial: string; // base64url of Ristretto255 point B_i = k_i * A
+  ct_i: string; // base64url of ChaCha20-Poly1305 ciphertext { z_i, rs_i }
   sessionId: string;
   sub: string;
 }
@@ -66,7 +76,7 @@ export interface RefreshRequest {
 export interface RefreshResponse {
   nodeId: number;
   commitment: { D: Uint8Array; E: Uint8Array };
-  ct_i: EncryptedPayload;
+  ct_i: string; // base64url of ChaCha20-Poly1305 ciphertext
   ctr: number;
   sub: string;
 }
@@ -88,11 +98,16 @@ export class IdentityNode {
   }
 
   /**
-   * Register user with password (simulating PASTA registration establishing h_i)
+   * Register user with TOPRF key share and server-specific key h_i.
+   * Master password and master secret h are NEVER revealed to the node!
    */
-  public registerUser(username: string, password: string, sub: string): void {
-    const h_i = deriveNodeKey(password, username, this.nodeId);
-    this.users.set(username, { username, sub, h_i });
+  public registerUser(
+    username: string,
+    sub: string,
+    toprfKeyShare: Share,
+    h_i: Uint8Array
+  ): void {
+    this.users.set(username, { username, sub, toprfKeyShare, h_i });
   }
 
   /**
@@ -106,9 +121,13 @@ export class IdentityNode {
 
   /**
    * Round 2: Process Sign-On Request
-   * Node signs user payload and encrypts { z_i, rs_i } using h_i.
-   * Node NEVER verifies plaintext password — encryption with h_i ensures
-   * only the legitimate user can decrypt the share!
+   * 1. Evaluates TOPRF partial point B_i = k_i * A without learning password
+   * 2. Signs byte-identical JWT payload using FROST share z_i
+   * 3. Encrypts { z_i, rs_i } using h_i and ChaCha20-Poly1305 (AAD = signingInput)
+   *
+   * Security Guarantee:
+   * The node NEVER knows or verifies the plaintext password.
+   * Encryption with h_i ensures ONLY the client holding the correct password can decrypt the share!
    */
   public handleSignOn(
     roundId: string,
@@ -117,8 +136,6 @@ export class IdentityNode {
   ): SignOnResponse {
     const user = this.users.get(req.username);
     if (!user) {
-      // In PASTA, server still outputs blind evaluation even if user not found to prevent timing attacks,
-      // but for deterministic simulation throw or use dummy.
       throw new Error(`User not found on node ${this.nodeId}`);
     }
 
@@ -128,7 +145,12 @@ export class IdentityNode {
     }
     this.activeNonces.delete(roundId);
 
-    // Build byte-identical payload
+    // 1. TOPRF partial evaluation B_i = k_i * A
+    const blindedPointBytes = base64UrlDecode(req.blinded);
+    const blindedPoint = ristretto255.Point.fromBytes(blindedPointBytes);
+    const partialPoint = evaluate(user.toprfKeyShare, blindedPoint);
+
+    // 2. Build byte-identical payload
     const header = { alg: "EdDSA", typ: "JWT", kid: "pasta-group-key-1" };
     const payload = {
       iss: req.iss,
@@ -142,7 +164,7 @@ export class IdentityNode {
 
     const { signingInput } = createSigningInput(header, payload);
 
-    // Compute FROST signature share z_i
+    // 3. Compute FROST signature share z_i
     const z_i = computeSignatureShare(
       this.nodeId,
       nonces,
@@ -153,7 +175,7 @@ export class IdentityNode {
       req.allParticipants
     );
 
-    // Generate node session secret rs_i (docs/refresh-token.md)
+    // 4. Generate node session secret rs_i (docs/refresh-token.md & Hole 5)
     const rs_i = crypto.randomBytes(32);
     const sessionId = req.sessionId;
 
@@ -168,18 +190,26 @@ export class IdentityNode {
     };
     this.sessions.set(sessionId, sessionRecord);
 
-    // Encrypt { z_i, rs_i } with h_i and AAD = signingInput
+    // 5. Encrypt { z_i, rs_i } using ChaCha20-Poly1305 with h_i and AAD = signingInput
+    const sessionNonceBytes = base64UrlDecode(req.sessionNonce);
+    const aeadNonce = deriveAeadNonce(sessionNonceBytes, this.nodeId);
     const shareBundle = JSON.stringify({
       z_i: z_i.toString(),
       rs_i: base64UrlEncode(rs_i),
     });
 
-    const ct_i = encryptAead(user.h_i, new TextEncoder().encode(shareBundle), signingInput);
+    const ct_i = aeadEncrypt(
+      user.h_i,
+      aeadNonce,
+      new TextEncoder().encode(shareBundle),
+      signingInput
+    );
 
     return {
       nodeId: this.nodeId,
       commitment,
-      ct_i,
+      toprfPartial: base64UrlEncode(partialPoint.toRawBytes()),
+      ct_i: base64UrlEncode(ct_i),
       sessionId,
       sub: user.sub,
     };
@@ -256,18 +286,27 @@ export class IdentityNode {
 
     // Hole 5: rk_i = HKDF(rs_i, ctr)
     const rk_i = deriveRefreshKey(session.rs_i, session.ctr, session.sessionId);
+    const refreshNonce = deriveAeadNonce(
+      new TextEncoder().encode(`REFRESH:${session.sessionId}:${session.ctr}`),
+      this.nodeId
+    );
 
     const shareBundle = JSON.stringify({
       z_i: z_i.toString(),
     });
 
-    // Encrypt share with rk_i and AAD = signingInput
-    const ct_i = encryptAead(rk_i, new TextEncoder().encode(shareBundle), signingInput);
+    // Encrypt share with rk_i and ChaCha20-Poly1305 with AAD = signingInput
+    const ct_i = aeadEncrypt(
+      rk_i,
+      refreshNonce,
+      new TextEncoder().encode(shareBundle),
+      signingInput
+    );
 
     return {
       nodeId: this.nodeId,
       commitment,
-      ct_i,
+      ct_i: base64UrlEncode(ct_i),
       ctr: session.ctr,
       sub: session.sub,
     };
@@ -278,5 +317,38 @@ export class IdentityNode {
    */
   public getSession(sessionId: string): NodeSessionRecord | undefined {
     return this.sessions.get(sessionId);
+  }
+}
+
+/**
+ * Client-side user registration utility:
+ * Generates TOPRF key shares via Shamir secret sharing,
+ * locally computes master PRF value h and per-node keys h_i,
+ * and registers them to nodes.
+ * The master password is NEVER revealed to any node!
+ */
+export function registerUserToNodes(
+  nodes: IdentityNode[],
+  username: string,
+  password: string,
+  sub: string,
+  threshold: number = 2
+): void {
+  const total = nodes.length;
+  const toprfKeyShares = generateToprfKey(total, threshold);
+
+  const { blinding, blinded } = blind(password);
+  const partials = toprfKeyShares.slice(0, threshold).map((s) => ({
+    id: s.id,
+    point: evaluate(s, blinded),
+  }));
+  const v = unblind(blinding, partials);
+  const h = finalize(password, v);
+
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i];
+    const keyShare = toprfKeyShares[i];
+    const serverKey = deriveServerKey(h, node.nodeId);
+    node.registerUser(username, sub, keyShare, serverKey);
   }
 }

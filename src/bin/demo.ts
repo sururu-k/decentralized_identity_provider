@@ -1,5 +1,5 @@
 import { generateShamirShares, randomScalar } from "../crypto/frost.js";
-import { IdentityNode } from "../protocol/node.js";
+import { IdentityNode, registerUserToNodes } from "../protocol/node.js";
 import { PastaOAuthProxy } from "../gateway/proxy.js";
 import { OidcEndpointHandler } from "../gateway/oidc.js";
 import { DecentralizedClientSdk } from "../client-sdk/client.js";
@@ -32,15 +32,13 @@ async function runDemo() {
   console.log(`[+] Group Public Key (Ed25519, 32 bytes): ${Buffer.from(groupPublicKey).toString("hex")}`);
   console.log(`[+] Secret shared across Node 1, Node 2, Node 3 (each node only holds s_i)`);
 
-  // User Registration
+  // User Registration via client-side PASTA TOPRF protocol
   const username = "alice";
   const password = "correct-battery-horse-staple";
   const userSub = "usr_alice_7701";
 
-  for (const node of nodes) {
-    node.registerUser(username, password, userSub);
-  }
-  console.log(`[+] User '${username}' registered across nodes (nodes do not store plaintext passwords)`);
+  registerUserToNodes(nodes, username, password, userSub, 2);
+  console.log(`[+] User '${username}' registered via TOPRF (nodes store only k_i and h_i; zero password knowledge)`);
 
   // ---------------------------------------------------------------------------
   // Phase 2: Gateway & OAuth Proxy Initialization
@@ -74,6 +72,8 @@ async function runDemo() {
     participants: [1, 2, 3], // Cluster of all 3 nodes establishes session secrets rs_i
   });
 
+  console.log(`PUBKEY ${Buffer.from(groupPublicKey).toString("hex")}`);
+  console.log(`TOKEN ${id_token}`);
   console.log(`[+] Sign-on completed!`);
   console.log(`[+] Established Session ID (Refresh Token): ${sessionId}`);
   console.log(`[+] Minted ID Token (Ed25519 JWT):`);

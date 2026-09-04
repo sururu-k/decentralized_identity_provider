@@ -13,7 +13,7 @@ import {
 import { OidcEndpointHandler } from "../src/gateway/oidc.js";
 import { PastaOAuthProxy } from "../src/gateway/proxy.js";
 import { GatewaySessionManager } from "../src/gateway/session.js";
-import { IdentityNode } from "../src/protocol/node.js";
+import { IdentityNode, registerUserToNodes } from "../src/protocol/node.js";
 import { DecentralizedClientSdk } from "../src/client-sdk/client.js";
 import { generateShamirShares, randomScalar } from "../src/crypto/frost.js";
 import { verifyJwt } from "../src/jwt/jwt.js";
@@ -175,9 +175,7 @@ describe("Decentralized Sign-On & Refresh Integration (Holes 2, 4, 5, 7)", () =>
     const password = "my-secure-password";
     const userSub = "usr_alice_999";
 
-    for (const node of nodes) {
-      node.registerUser(username, password, userSub);
-    }
+    registerUserToNodes(nodes, username, password, userSub, 2);
 
     const proxy = new PastaOAuthProxy(nodes, 2);
     const clientSdk = new DecentralizedClientSdk({
@@ -226,5 +224,33 @@ describe("Decentralized Sign-On & Refresh Integration (Holes 2, 4, 5, 7)", () =>
     });
     expect(refreshedVerify.valid).toBe(true);
     expect(refreshedVerify.payload.sub).toBe(userSub);
+  });
+
+  it("fails sign-on when user enters incorrect password due to TOPRF authentication failure", async () => {
+    const masterSecret = randomScalar();
+    const { groupPublicKey, shares } = generateShamirShares(masterSecret, 2, 3);
+
+    const nodes = [
+      new IdentityNode(1, shares.get(1)!, groupPublicKey),
+      new IdentityNode(2, shares.get(2)!, groupPublicKey),
+      new IdentityNode(3, shares.get(3)!, groupPublicKey),
+    ];
+
+    registerUserToNodes(nodes, "bob", "correct-password", "usr_bob_888", 2);
+
+    const proxy = new PastaOAuthProxy(nodes, 2);
+    const clientSdk = new DecentralizedClientSdk({
+      proxy,
+      issuer: "https://idp.example.com",
+    });
+
+    await expect(
+      clientSdk.signOn({
+        username: "bob",
+        password: "WRONG-password",
+        clientId: "rp_client",
+        nonce: "nonce_fail_1",
+      })
+    ).rejects.toThrow("Invalid password or corrupted share");
   });
 });

@@ -5,6 +5,8 @@ import { GatewaySessionManager } from "./session.js";
 
 export interface ProxySignOnRequestBody {
   username: string;
+  blinded: string; // base64url of Ristretto255 blinded point A
+  sessionNonce: string; // base64url of session nonce
   cnfJkt: string;
   nonce?: string;
   iat: number;
@@ -102,6 +104,8 @@ export class PastaOAuthProxy {
         {
           sessionId,
           username: body.username,
+          blinded: body.blinded,
+          sessionNonce: body.sessionNonce,
           cnfJkt: body.cnfJkt,
           nonce: body.nonce,
           iat: body.iat,

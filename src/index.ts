@@ -97,6 +97,16 @@ export {
   IdpClient,
 } from './protocol/client.js';
 
+export {
+  IdentityNode,
+  registerUserToNodes,
+  type UserRecord as NodeUserRecord,
+  type SignOnRequest as NodeSignOnRequest,
+  type SignOnResponse as NodeSignOnResponse,
+  type RefreshRequest as NodeRefreshRequest,
+  type RefreshResponse as NodeRefreshResponse,
+} from './protocol/node.js';
+
 // OAuth 2.0 / OIDC Client SDK & DPoP (Holes 2, 4, 7)
 export {
   type DPoPKeyPair,

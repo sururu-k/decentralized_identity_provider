@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateShamirShares, randomScalar } from "../crypto/frost.js";
-import { IdentityNode } from "../protocol/node.js";
+import { IdentityNode, registerUserToNodes } from "../protocol/node.js";
 import { PastaOAuthProxy } from "../gateway/proxy.js";
 import { OidcEndpointHandler } from "../gateway/oidc.js";
 import { verifyJwt } from "../jwt/jwt.js";
@@ -27,11 +27,10 @@ const nodes: IdentityNode[] = [
   new IdentityNode(3, shares.get(3)!, groupPublicKey),
 ];
 
-// Pre-register demo users on all nodes (PASTA registration)
-for (const node of nodes) {
-  node.registerUser("alice", "password123", "usr_alice_12345");
-  node.registerUser("bob", "password456", "usr_bob_67890");
-}
+// Pre-register demo users on all nodes via client-side PASTA protocol
+// Nodes receive only toprfKeyShare and h_i; nodes NEVER learn the passwords!
+registerUserToNodes(nodes, "alice", "password123", "usr_alice_12345", 2);
+registerUserToNodes(nodes, "bob", "password456", "usr_bob_67890", 2);
 
 // 2. Initialize OAuth Proxy and OIDC Handler
 const proxy = new PastaOAuthProxy(nodes, 2);
