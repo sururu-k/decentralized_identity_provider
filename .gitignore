@@ -1,3 +1,9 @@
+# ---- Node.js / TypeScript ----
+node_modules/
+dist/
+demo/node_modules/
+.npm/
+
 # ---- Rust / Cargo ----
 /target/
 **/*.rs.bk
