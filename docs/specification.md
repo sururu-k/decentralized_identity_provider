@@ -144,7 +144,7 @@ sequenceDiagram
 
 ## 7. 関連ドキュメント
 
-- [`docs/whiteboard-current.md`](./whiteboard-current.md): 現行アーキテクチャ解説（ホワイトボード右側「OAuthプロキシで形を戻す」の具現化と暗号マッピング）
+- [`README.md`](../README.md): 全体概要および現行アーキテクチャ解説（ホワイトボード構想の具現化）
 - [`docs/whiteboard-gaps.md`](./whiteboard-gaps.md): 設計の原点となったホワイトボード検討記録
 - [`docs/refresh-token.md`](./refresh-token.md): OAuth仕様を壊さないリフレッシュトークン設計
 - [`docs/status.md`](./status.md): 学会投稿先（SSR, RWC, IWSEC等）の分析と残論点
