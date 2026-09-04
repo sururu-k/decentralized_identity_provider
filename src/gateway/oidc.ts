@@ -141,181 +141,20 @@ export class OidcEndpointHandler {
     nonce: string;
     scope: string;
   }): string {
+    const demoUrl =
+      `/demo?step=login` +
+      `&redirect_uri=${encodeURIComponent(params.redirectUri)}` +
+      `&client_id=${encodeURIComponent(params.clientId)}` +
+      `&nonce=${encodeURIComponent(params.nonce)}` +
+      `&state=${encodeURIComponent(params.state || '')}` +
+      `&scope=${encodeURIComponent(params.scope)}`;
     return `<!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
   <meta charset="utf-8">
-  <title>Decentralized Identity Login</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    :root {
-      --bg: #0f172a;
-      --card: #1e293b;
-      --text: #f8fafc;
-      --subtext: #94a3b8;
-      --primary: #6366f1;
-      --primary-hover: #4f46e5;
-      --border: #334155;
-    }
-    body {
-      margin: 0;
-      padding: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 100vh;
-    }
-    .container {
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 2rem;
-      width: 100%;
-      max-width: 440px;
-      box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5);
-    }
-    h2 { margin-top: 0; font-size: 1.25rem; font-weight: 600; }
-    .badge {
-      display: inline-block;
-      font-size: 0.75rem;
-      padding: 0.25rem 0.5rem;
-      background: #312e81;
-      color: #c7d2fe;
-      border-radius: 4px;
-      margin-bottom: 1rem;
-    }
-    .field { margin-bottom: 1rem; text-align: left; }
-    label { display: block; font-size: 0.875rem; color: var(--subtext); margin-bottom: 0.25rem; }
-    input {
-      width: 100%;
-      padding: 0.625rem;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-      background: #090d16;
-      color: var(--text);
-      box-sizing: border-box;
-      font-size: 0.95rem;
-    }
-    button {
-      width: 100%;
-      padding: 0.75rem;
-      border-radius: 6px;
-      border: none;
-      background: var(--primary);
-      color: white;
-      font-weight: 600;
-      cursor: pointer;
-      margin-top: 1rem;
-    }
-    button:hover { background: var(--primary-hover); }
-    .footer-note {
-      margin-top: 1.5rem;
-      font-size: 0.75rem;
-      color: var(--subtext);
-      line-height: 1.4;
-      border-top: 1px solid var(--border);
-      padding-top: 1rem;
-    }
-    #status-msg {
-      margin-top: 1rem;
-      font-size: 0.85rem;
-      min-height: 1.25rem;
-      color: #38bdf8;
-    }
-  </style>
+  <meta http-equiv="refresh" content="0; url=${demoUrl}">
 </head>
-<body>
-  <div class="container">
-    <span class="badge">RFC 9449 DPoP + response_mode=form_post Enabled</span>
-    <h2>Sign in with Decentralized IdP</h2>
-    <p style="font-size: 0.875rem; color: var(--subtext); margin-bottom: 1.5rem;">
-      Application <strong>${params.clientId}</strong> is requesting authentication.
-    </p>
-
-    <form id="auth-form">
-      <div class="field">
-        <label for="username">Username</label>
-        <input type="text" id="username" name="username" value="alice" required />
-      </div>
-      <div class="field">
-        <label for="password">Password</label>
-        <input type="password" id="password" name="password" value="password123" required />
-      </div>
-      <button type="submit" id="submit-btn">Authorize &amp; Sign In</button>
-      <div id="status-msg"></div>
-    </form>
-
-    <div class="footer-note">
-      <strong>Zero-Knowledge Proxy Guarantee:</strong><br>
-      The proxy relays encrypted cryptographic shares and cannot view your credentials, session secrets, or ID Token.
-      The token is aggregated locally in your browser and POSTed directly to <code>${params.redirectUri}</code>.
-    </div>
-  </div>
-
-  <script>
-    // In-browser client script orchestration
-    const redirectUri = ${JSON.stringify(params.redirectUri)};
-    const state = ${JSON.stringify(params.state || "")};
-    const nonce = ${JSON.stringify(params.nonce)};
-    const clientId = ${JSON.stringify(params.clientId)};
-
-    document.getElementById('auth-form').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const status = document.getElementById('status-msg');
-      const btn = document.getElementById('submit-btn');
-      btn.disabled = true;
-      status.innerText = "Generating ephemeral DPoP key & requesting shares...";
-
-      // Browser simulation of client SDK
-      try {
-        const username = document.getElementById('username').value;
-        const password = document.getElementById('password').value;
-
-        // Perform sign-on via client SDK logic exposed by the client bundle
-        const res = await fetch('/api/pasta/browser-sign-on', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username, password, redirectUri, state, nonce, clientId })
-        });
-        const data = await res.json();
-        if (!data.success) {
-          throw new Error(data.error || "Authentication failed");
-        }
-
-        status.innerText = "Aggregated ID token successfully! Redirecting via form_post...";
-        // Form post directly to RP
-        const form = document.createElement('form');
-        form.method = 'POST';
-        form.action = redirectUri;
-        form.style.display = 'none';
-
-        const tokenInput = document.createElement('input');
-        tokenInput.type = 'hidden';
-        tokenInput.name = 'id_token';
-        tokenInput.value = data.id_token;
-        form.appendChild(tokenInput);
-
-        if (state) {
-          const stateInput = document.createElement('input');
-          stateInput.type = 'hidden';
-          stateInput.name = 'state';
-          stateInput.value = state;
-          form.appendChild(stateInput);
-        }
-
-        document.body.appendChild(form);
-        form.submit();
-      } catch (err) {
-        status.style.color = '#ef4444';
-        status.innerText = "Error: " + err.message;
-        btn.disabled = false;
-      }
-    });
-  </script>
-</body>
+<body></body>
 </html>`;
   }
 }

@@ -14,6 +14,12 @@ export default function App() {
   const initialStep = rawStep === 'jwt' ? 'completed' : (rawStep as any);
   const initialTab = rawStep === 'jwt' ? 'jwt' : (urlParams?.get('tab') as any) || 'visualizer';
 
+  // OAuth フロー連携パラメータ — /rp → /authorize → /demo?redirect_uri=...
+  const oauthRedirectUri = urlParams?.get('redirect_uri') || null;
+  const oauthClientId = urlParams?.get('client_id') || 'zk_app_portal';
+  const oauthNonce = urlParams?.get('nonce') || ('demo_nonce_' + Math.random().toString(36).substring(7));
+  const oauthState = urlParams?.get('state') || 'demo_state_xyz789';
+
   const defaultMockToken =
     'eyJhbGciOiJFZERTQSIswitchInR5cCI6IkpXVCIsImtpZCI6InBhc3RhLWZyb3N0ZWQyNTUxOS1wazEifQ.eyJpc3MiOiJodHRwczovL2lkcC5wYXN0YS5leGFtcGxlIiwic3ViIjoidXNyX2FsaWNlXzEyMzQ1IiwiYXVkIjoiemtfYXBwX3BvcnRhbCIsImlhdCI6MTcyMTAxMDAwMCwiZXhwIjoxNzIxMDEzODAwLCJqdGkiOiJqdGlfZGVtb185OTkiLCJjbmYiOnsiamt0IjoiNmNQUU5JbWZiaHFtakh6NVhEOVU4MjZ1WllMNUtSNVNtOWJtM051UVhNIn19.dGVzdF9zaWduYXR1cmVfZm9yX2RlbW9fcGFzdGFfZm9yX3NjcmVlbnNob3Q';
 
@@ -103,8 +109,8 @@ export default function App() {
         body: JSON.stringify({
           username,
           password,
-          clientId: 'zk_app_portal',
-          nonce: 'demo_nonce_' + Math.random().toString(36).substring(7),
+          clientId: oauthClientId,
+          nonce: oauthNonce,
         }),
       });
       const data = await res.json();
@@ -170,10 +176,11 @@ export default function App() {
 
   const submitFormPostToRp = () => {
     if (!idToken) return;
+    const targetUri = oauthRedirectUri || 'http://localhost:3000/demo/rp-callback';
     const form = document.createElement('form');
     form.method = 'POST';
-    form.action = 'http://localhost:3000/demo/rp-callback';
-    form.target = '_blank';
+    form.action = targetUri;
+    form.target = oauthRedirectUri ? '_self' : '_blank';
 
     const tokenInput = document.createElement('input');
     tokenInput.type = 'hidden';
@@ -184,7 +191,7 @@ export default function App() {
     const stateInput = document.createElement('input');
     stateInput.type = 'hidden';
     stateInput.name = 'state';
-    stateInput.value = 'demo_state_xyz789';
+    stateInput.value = oauthState;
     form.appendChild(stateInput);
 
     document.body.appendChild(form);
