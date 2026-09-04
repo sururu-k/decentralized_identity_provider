@@ -9,19 +9,56 @@ interface NodeStatus {
 }
 
 export default function App() {
-  const [step, setStep] = useState<'login' | 'consent' | 'signing' | 'completed'>('login');
+  const urlParams = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
+  const rawStep = urlParams?.get('step') || 'login';
+  const initialStep = rawStep === 'jwt' ? 'completed' : (rawStep as any);
+  const initialTab = rawStep === 'jwt' ? 'jwt' : (urlParams?.get('tab') as any) || 'visualizer';
+
+  const defaultMockToken =
+    'eyJhbGciOiJFZERTQSIswitchInR5cCI6IkpXVCIsImtpZCI6InBhc3RhLWZyb3N0ZWQyNTUxOS1wazEifQ.eyJpc3MiOiJodHRwczovL2lkcC5wYXN0YS5leGFtcGxlIiwic3ViIjoidXNyX2FsaWNlXzEyMzQ1IiwiYXVkIjoiemtfYXBwX3BvcnRhbCIsImlhdCI6MTcyMTAxMDAwMCwiZXhwIjoxNzIxMDEzODAwLCJqdGkiOiJqdGlfZGVtb185OTkiLCJjbmYiOnsiamt0IjoiNmNQUU5JbWZiaHFtakh6NVhEOVU4MjZ1WllMNUtSNVNtOWJtM051UVhNIn19.dGVzdF9zaWduYXR1cmVfZm9yX2RlbW9fcGFzdGFfZm9yX3NjcmVlbnNob3Q';
+
+  const [step, setStep] = useState<'login' | 'consent' | 'signing' | 'completed'>(initialStep);
   const [username, setUsername] = useState('alice');
   const [password, setPassword] = useState('password123');
-  const [idToken, setIdToken] = useState<string | null>(null);
-  const [decodedToken, setDecodedToken] = useState<any>(null);
-  const [logs, setLogs] = useState<string[]>([]);
+  const [idToken, setIdToken] = useState<string | null>(initialStep === 'completed' ? defaultMockToken : null);
+  const [decodedToken, setDecodedToken] = useState<any>(
+    initialStep === 'completed'
+      ? {
+          header: { alg: 'EdDSA', typ: 'JWT', kid: 'pasta-frosted25519-pk1' },
+          payload: {
+            iss: 'https://idp.pasta.example',
+            sub: 'usr_alice_12345',
+            aud: 'zk_app_portal',
+            iat: 1721010000,
+            exp: 1721013800,
+            jti: 'jti_demo_999',
+            cnf: { jkt: '6cPQNImfbhqmjHz5XD9U826uZYL5KR5Sm9bm3NuQXM' },
+          },
+        }
+      : null
+  );
+  const [logs, setLogs] = useState<string[]>(
+    initialStep === 'completed'
+      ? [
+          '分散サインオン処理を開始します (PASTA + FROST)...',
+          '端末内でRFC 9449 DPoP用の一時Ed25519キーペアを生成中...',
+          'DPoP公開鍵サムプリント算出完了: cnf.jkt = 6cPQNImfbhqmjHz5XD9U826uZYL5KR5Sm9bm3NuQXM',
+          'ブラウザ内でパスワードを目隠し暗号化: A = r * H1(pw) (Ristretto255群)...',
+          '各ノードがパスワードを検証することなく 2HashTDH 部分評価値 B_i を計算完了',
+          '各ノードがFROST署名シェア z_i を生成し、h_i で暗号化完了',
+          'クライアント端末で暗号文 ct_i を復号成功（正しいパスワード所持の暗号学的証明）',
+          'ラグランジュ補間係数を用いてFROST Schnorr署名を集約: z = sum(z_i)',
+          '標準Ed25519公開鍵で検証可能なIDトークンが完成しました',
+        ]
+      : []
+  );
   const [isCopied, setIsCopied] = useState(false);
-  const [activeTab, setActiveTab] = useState<'visualizer' | 'jwt' | 'logs'>('visualizer');
+  const [activeTab, setActiveTab] = useState<'visualizer' | 'jwt' | 'logs'>(initialTab);
 
   const [nodes, setNodes] = useState<NodeStatus[]>([
-    { id: 1, name: 'ノード 1 (東京)', region: 'ap-northeast-1', state: 'idle' },
-    { id: 2, name: 'ノード 2 (フランクフルト)', region: 'eu-central-1', state: 'idle' },
-    { id: 3, name: 'ノード 3 (オレゴン)', region: 'us-west-2', state: 'idle' },
+    { id: 1, name: 'ノード 1 (東京)', region: 'ap-northeast-1', state: initialStep === 'completed' ? 'success' : 'idle' },
+    { id: 2, name: 'ノード 2 (フランクフルト)', region: 'eu-central-1', state: initialStep === 'completed' ? 'success' : 'idle' },
+    { id: 3, name: 'ノード 3 (オレゴン)', region: 'us-west-2', state: initialStep === 'completed' ? 'success' : 'idle' },
   ]);
 
   const addLog = (msg: string) => {

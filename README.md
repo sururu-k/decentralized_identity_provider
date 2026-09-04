@@ -63,7 +63,23 @@ sequenceDiagram
 
 ---
 
-## 3. クイックスタート
+## 3. デモ UI 実動画面
+
+実装された React デモ UI（`demo/`）の各画面フローです。
+
+| 1. ログイン画面 | 2. 認可同意画面 |
+|:---:|:---:|
+| ![ログイン画面](pic/screenshot_login.png) | ![認可同意画面](pic/screenshot_consent.png) |
+| パスワード目隠し（PASTA）による安全認証 | 要求スコープ確認と FROST 稼働状況 |
+
+| 3. 分散署名・集約完了 | 4. JWT トークン検証 |
+|:---:|:---:|
+| ![分散署名完了](pic/screenshot_completed.png) | ![JWT検証](pic/screenshot_jwt.png) |
+| 端末内署名集約と `form_post` 送信導線 | 標準 EdDSA (Ed25519) JWT と `cnf.jkt` |
+
+---
+
+## 4. クイックスタート
 
 ### 動作環境
 - Node.js v20 以上
@@ -91,8 +107,9 @@ npm run gateway
 
 ---
 
-## 4. ドキュメント一覧
+## 5. ドキュメント一覧
 
+- [`docs/whiteboard-current.md`](./docs/whiteboard-current.md): 現行アーキテクチャ解説（ホワイトボード右側「OAuthプロキシで形を戻す」の具現化と暗号マッピング）
 - [`docs/specification.md`](./docs/specification.md): アーキテクチャ仕様書（ホワイトボード穴①〜⑦の解決仕様、API、データスキーマ）
 - [`docs/whiteboard-gaps.md`](./docs/whiteboard-gaps.md): 設計の原点となったホワイトボード検討記録
 - [`docs/readme.md`](./docs/readme.md): 根本課題（なりすまし・権限集中）の論理的解説

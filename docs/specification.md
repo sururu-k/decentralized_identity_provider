@@ -115,11 +115,36 @@ sequenceDiagram
 
 ## 5. テスト・検証実績
 
-- **Vitest 統合テスト**: 全 38 件 合格
+- **Vitest 統合テスト**: 全 39 件 合格
   - `tests/crypto/crypto.test.ts` (14/14 件 PASS)
   - `tests/pasta_integration.test.ts` (14/14 件 PASS)
-  - `tests/gateway_and_dpop.test.ts` (10/10 件 PASS)
+  - `tests/gateway_and_dpop.test.ts` (11/11 件 PASS)
 - **独立した外部検証器 (`scripts/verify_token.py`)**:
   - Python `cryptography` (OpenSSL): 検証成功
   - PyNaCl (libsodium): 検証成功
   - ペイロード改竄 (`sub: admin`): 拒絶成功
+
+---
+
+## 6. デモ UI 実動画面
+
+実装された React デモ UI（`demo/`）の実際の稼働画面キャプチャです。
+
+| 1. ログイン画面 (`pic/screenshot_login.png`) | 2. 認可同意画面 (`pic/screenshot_consent.png`) |
+|:---:|:---:|
+| ![ログイン画面](../pic/screenshot_login.png) | ![認可同意画面](../pic/screenshot_consent.png) |
+| パスワード目隠し（PASTA）による安全認証 | 要求スコープ確認と FROST 稼働状況 |
+
+| 3. 分散署名・集約完了 (`pic/screenshot_completed.png`) | 4. JWT トークン検証 (`pic/screenshot_jwt.png`) |
+|:---:|:---:|
+| ![分散署名完了](../pic/screenshot_completed.png) | ![JWT検証](../pic/screenshot_jwt.png) |
+| 端末内署名集約と `form_post` 送信導線 | 標準 EdDSA (Ed25519) JWT と `cnf.jkt` |
+
+---
+
+## 7. 関連ドキュメント
+
+- [`docs/whiteboard-current.md`](./whiteboard-current.md): 現行アーキテクチャ解説（ホワイトボード右側「OAuthプロキシで形を戻す」の具現化と暗号マッピング）
+- [`docs/whiteboard-gaps.md`](./whiteboard-gaps.md): 設計の原点となったホワイトボード検討記録
+- [`docs/refresh-token.md`](./refresh-token.md): OAuth仕様を壊さないリフレッシュトークン設計
+- [`docs/status.md`](./status.md): 学会投稿先（SSR, RWC, IWSEC等）の分析と残論点
