@@ -254,6 +254,288 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // 8b. RP Top Page: third-party service landing page with "Login with PASTA IdP" button
+    if (method === "GET" && pathname === "/rp") {
+      const authorizeUrl =
+        `${ISSUER}/authorize?client_id=demo_client` +
+        `&redirect_uri=http://localhost:${PORT}/rp/callback` +
+        `&response_type=id_token&response_mode=form_post&scope=openid%20profile%20email` +
+        `&nonce=${Math.random().toString(36).slice(2)}&state=rp-demo`;
+      const rpTopHtml = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>ZK-App Portal</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f8fafc;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      background: #fff;
+      border-bottom: 1px solid #e2e8f0;
+      padding: 0 2rem;
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    header .logo { font-weight: 700; font-size: 1.1rem; color: #1e293b; letter-spacing: -0.02em; }
+    header nav a { color: #64748b; text-decoration: none; font-size: 0.875rem; margin-left: 1.5rem; }
+    header nav a:hover { color: #1e293b; }
+    main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 4rem 1rem;
+    }
+    .hero { text-align: center; max-width: 520px; }
+    .hero h1 { font-size: 2rem; font-weight: 800; color: #0f172a; margin: 0 0 1rem; line-height: 1.2; }
+    .hero p { color: #64748b; font-size: 1rem; line-height: 1.6; margin: 0 0 2.5rem; }
+    .login-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.625rem;
+      background: #4f46e5;
+      color: #fff;
+      font-size: 0.9375rem;
+      font-weight: 600;
+      padding: 0.75rem 1.75rem;
+      border-radius: 8px;
+      text-decoration: none;
+      transition: background 0.15s;
+    }
+    .login-btn:hover { background: #4338ca; }
+    .login-btn svg { flex-shrink: 0; }
+    .badge {
+      display: inline-block;
+      background: #ede9fe;
+      color: #6d28d9;
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 0.25rem 0.75rem;
+      border-radius: 100px;
+      margin-bottom: 1.5rem;
+      letter-spacing: 0.03em;
+    }
+    .features {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1rem;
+      max-width: 640px;
+      margin: 3rem 0 0;
+    }
+    .feature {
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      padding: 1rem;
+      font-size: 0.8125rem;
+      color: #475569;
+      text-align: center;
+    }
+    .feature strong { display: block; color: #1e293b; font-size: 0.875rem; margin-bottom: 0.25rem; }
+    footer {
+      text-align: center;
+      padding: 1.5rem;
+      font-size: 0.75rem;
+      color: #94a3b8;
+      border-top: 1px solid #e2e8f0;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <span class="logo">ZK-App Portal</span>
+    <nav>
+      <a href="#">機能</a>
+      <a href="#">料金</a>
+      <a href="#">ドキュメント</a>
+    </nav>
+  </header>
+  <main>
+    <div class="hero">
+      <span class="badge">分散型 ID 対応サービス</span>
+      <h1>ZK-App Portal へようこそ</h1>
+      <p>このサービスは PASTA 分散 IdP による OpenID Connect 認証に対応しています。<br>
+         OAuth プロキシが平文トークンを保持せず、ブラウザが端末内で署名を集約します。</p>
+      <a class="login-btn" href="${authorizeUrl}">
+        <svg width="18" height="18" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M15 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0zM3 20a9 9 0 0 1 18 0"/>
+        </svg>
+        PASTA IdP でログイン
+      </a>
+    </div>
+    <div class="features">
+      <div class="feature"><strong>秘密分散鍵</strong>単一障害点なし</div>
+      <div class="feature"><strong>ゼロ知識プロキシ</strong>AS はトークンを持たない</div>
+      <div class="feature"><strong>標準 OIDC</strong>RP 側の改修不要</div>
+    </div>
+  </main>
+  <footer>ZK-App Portal (RP デモ) — PASTA + FROST + OAuth Proxy</footer>
+</body>
+</html>`;
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(rpTopHtml);
+      return;
+    }
+
+    // 8c. RP Callback: receives id_token via form_post, verifies, shows welcome screen
+    if (method === "POST" && pathname === "/rp/callback") {
+      const formParams = await readUrlEncodedBody(req);
+      const idToken = formParams.id_token;
+
+      if (!idToken) {
+        res.writeHead(400, { "Content-Type": "text/html" });
+        res.end("<h1>400 Bad Request: Missing id_token</h1>");
+        return;
+      }
+
+      const verifyRes = verifyJwt(idToken, groupPublicKey, { iss: ISSUER });
+      const sub = verifyRes.payload?.sub ?? "(不明)";
+      const iat = verifyRes.payload?.iat
+        ? new Date((verifyRes.payload.iat as number) * 1000).toLocaleString("ja-JP")
+        : "-";
+
+      const rpCallbackHtml = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>ZK-App Portal - ログイン成功</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f8fafc;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      background: #fff;
+      border-bottom: 1px solid #e2e8f0;
+      padding: 0 2rem;
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    header .logo { font-weight: 700; font-size: 1.1rem; color: #1e293b; letter-spacing: -0.02em; }
+    .user-pill {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.875rem;
+      color: #475569;
+    }
+    .avatar {
+      width: 28px; height: 28px;
+      background: #4f46e5;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      color: #fff; font-size: 0.75rem; font-weight: 700;
+    }
+    main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 1rem;
+    }
+    .card {
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 2rem;
+      max-width: 600px;
+      width: 100%;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }
+    .success-banner {
+      background: #f0fdf4;
+      border: 1px solid #bbf7d0;
+      border-radius: 8px;
+      padding: 0.875rem 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 1.5rem;
+    }
+    .check { color: #16a34a; font-size: 1.25rem; }
+    .success-banner strong { color: #15803d; }
+    .success-banner span { font-size: 0.875rem; color: #166534; }
+    h2 { font-size: 1.25rem; color: #0f172a; margin: 0 0 1rem; font-weight: 700; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+    th, td { text-align: left; padding: 0.5rem 0.625rem; border-bottom: 1px solid #f1f5f9; }
+    th { color: #64748b; font-weight: 500; width: 40%; }
+    td { color: #1e293b; font-family: ui-monospace, monospace; font-size: 0.8125rem; word-break: break-all; }
+    .detail { margin-top: 1.5rem; }
+    summary { cursor: pointer; color: #6366f1; font-size: 0.875rem; font-weight: 500; padding: 0.5rem 0; }
+    pre { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.875rem; font-size: 0.75rem; overflow-x: auto; color: #334155; margin: 0.5rem 0 0; }
+    .back { display: inline-block; margin-top: 1.5rem; color: #6366f1; font-size: 0.875rem; font-weight: 500; text-decoration: none; }
+    .back:hover { text-decoration: underline; }
+    .note { font-size: 0.75rem; color: #94a3b8; margin-top: 1rem; line-height: 1.5; }
+    footer {
+      text-align: center;
+      padding: 1.5rem;
+      font-size: 0.75rem;
+      color: #94a3b8;
+      border-top: 1px solid #e2e8f0;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <span class="logo">ZK-App Portal</span>
+    <div class="user-pill">
+      <div class="avatar">${String(sub).slice(4, 5).toUpperCase() || "U"}</div>
+      <span>${sub}</span>
+    </div>
+  </header>
+  <main>
+    <div class="card">
+      <div class="success-banner">
+        <span class="check">&#10003;</span>
+        <div>
+          <strong>認証成功</strong><br>
+          <span>PASTA 分散 IdP により Ed25519 署名が検証されました</span>
+        </div>
+      </div>
+      <h2>ログイン情報</h2>
+      <table>
+        <tr><th>ユーザー識別子 (sub)</th><td>${sub}</td></tr>
+        <tr><th>発行時刻 (iat)</th><td>${iat}</td></tr>
+        <tr><th>署名検証</th><td>${verifyRes.valid ? "Ed25519 (EdDSA) — 有効" : "失敗: " + verifyRes.error}</td></tr>
+        <tr><th>トークン配送経路</th><td>ブラウザ form_post (プロキシ非経由)</td></tr>
+      </table>
+      <details class="detail">
+        <summary>JWT クレーム (生データ)</summary>
+        <pre>${JSON.stringify(verifyRes.payload, null, 2)}</pre>
+      </details>
+      <p class="note">
+        OAuth プロキシは暗号化シェアを中継したのみで、このトークンの平文に関与していません。<br>
+        RP はグループ公開鍵 (JWKS) を参照し、標準 Ed25519 として単独で検証しています。
+      </p>
+      <a class="back" href="/rp">← ZK-App Portal トップに戻る</a>
+    </div>
+  </main>
+  <footer>ZK-App Portal (RP デモ) — PASTA + FROST + OAuth Proxy</footer>
+</body>
+</html>`;
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(rpCallbackHtml);
+      return;
+    }
+
     // Default 404
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("Not Found");
