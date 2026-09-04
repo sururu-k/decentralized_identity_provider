@@ -169,7 +169,25 @@ npm run demo | python3 scripts/verify_token.py
 npm run gateway
 ```
 
-ブラウザで [http://localhost:3000](http://localhost:3000) または [http://localhost:3000/demo](http://localhost:3000/demo) を開くと、分散署名プロトコルの可視化UIを操作できます。
+### エンドポイント一覧（`npm run gateway` 起動後）
+
+#### 実ユースケースフロー（一本道）
+
+| 順 | URL | 役割 |
+|:--:|:--|:--|
+| 1 | [http://localhost:3000/rp](http://localhost:3000/rp) | 第三者サービス (ZK-App Portal) のトップ。「PASTA IdP でログイン」ボタン |
+| 2 | [http://localhost:3000/authorize?...](http://localhost:3000/authorize?client_id=demo_client&redirect_uri=http://localhost:3000/rp/callback&response_type=id_token&response_mode=form_post&scope=openid&nonce=n) | OAuth 認可エンドポイント。即座に `/demo` へリダイレクト |
+| 3 | [http://localhost:3000/demo](http://localhost:3000/demo) | PASTA 分散 IdP ログイン・同意・FROST 署名アニメーション |
+| 4 | [http://localhost:3000/rp/callback](http://localhost:3000/rp/callback) | RP コールバック。`id_token` を受信・Ed25519 検証・クレーム表示 |
+
+#### その他エンドポイント
+
+| URL | 役割 |
+|:--|:--|
+| [http://localhost:3000/.well-known/openid-configuration](http://localhost:3000/.well-known/openid-configuration) | OIDC Discovery Document |
+| [http://localhost:3000/jwks.json](http://localhost:3000/jwks.json) | グループ公開鍵 (Ed25519 JWK Set) |
+| [http://localhost:3000/api/pasta/sign-on](http://localhost:3000/api/pasta/sign-on) | ブラインド値 A を受け取り、ノード群に中継して暗号化シェアを返す |
+| [http://localhost:3000/api/pasta/refresh](http://localhost:3000/api/pasta/refresh) | RFC 9700 sender-constrained リフレッシュ |
 
 ---
 
