@@ -10,6 +10,78 @@ interface NodeStatus {
   state: 'idle' | 'sending' | 'evaluating' | 'encrypted' | 'success';
 }
 
+/**
+ * The one journey the audience follows, shared verbatim with the rp pages
+ * (projects/rp/src/html.ts). Six stages that cross two origins: the rp front end
+ * (localhost:3001) owns stages 1 and 4-6, the IdP (localhost:3000) owns 2-3.
+ */
+const FLOW_STEPS: { label: string; sub: string; origin: 'rp' | 'idp' }[] = [
+  { label: 'ログイン開始', sub: 'localhost:3001', origin: 'rp' },
+  { label: 'IdP で認証', sub: 'PASTA', origin: 'idp' },
+  { label: 'アサーション発行', sub: 'code', origin: 'idp' },
+  { label: 'RP へ戻る', sub: 'redirect', origin: 'rp' },
+  { label: 'トークン交換', sub: 'DPoP', origin: 'rp' },
+  { label: 'トークン取得', sub: 'access_token', origin: 'rp' },
+];
+
+/**
+ * The cross-origin progress bar. `current` is the 1-based stage this page is on;
+ * earlier stages read as done, later ones as upcoming. The marker hue names the origin
+ * that owns the stage (rp = blue, IdP = violet), so the audience sees the flow cross
+ * from blue to violet and back. The rp pages render the same six stages in plain CSS.
+ */
+function FlowStepper({ current }: { current: number }) {
+  return (
+    <nav aria-label="フロー全体の進行" className="w-full max-w-4xl mx-auto">
+      <ol className="flex items-start">
+        {FLOW_STEPS.map((s, i) => {
+          const n = i + 1;
+          const state = n < current ? 'done' : n === current ? 'current' : 'upcoming';
+          const isRp = s.origin === 'rp';
+          const marker =
+            state === 'current'
+              ? isRp
+                ? 'bg-blue-500 border-blue-400 text-white shadow-lg shadow-blue-500/40 ring-4 ring-blue-500/20'
+                : 'bg-violet-500 border-violet-400 text-white shadow-lg shadow-violet-500/40 ring-4 ring-violet-500/20'
+              : state === 'done'
+              ? isRp
+                ? 'bg-blue-500/10 border-blue-500/50 text-blue-300'
+                : 'bg-violet-500/10 border-violet-500/50 text-violet-300'
+              : 'bg-slate-900 border-slate-700 text-slate-600';
+          const labelCls =
+            state === 'current'
+              ? 'text-white font-semibold'
+              : state === 'done'
+              ? 'text-slate-300'
+              : 'text-slate-600';
+          return (
+            <li key={n} className="flex-1 flex flex-col items-center relative min-w-0">
+              {n > 1 && (
+                <span
+                  className={`absolute top-4 right-1/2 h-0.5 w-full z-0 ${
+                    n <= current ? 'bg-slate-500' : 'bg-slate-800'
+                  }`}
+                />
+              )}
+              <span
+                className={`relative z-10 w-8 h-8 rounded-full border flex items-center justify-center text-xs font-bold transition-all ${marker}`}
+              >
+                {state === 'done' ? '✓' : n}
+              </span>
+              <span className={`mt-2 text-[11px] leading-tight text-center px-1 ${labelCls}`}>
+                {s.label}
+              </span>
+              <span className="mt-0.5 text-[9px] font-mono text-slate-500 text-center leading-none">
+                {s.sub}
+              </span>
+            </li>
+          );
+        })}
+      </ol>
+    </nav>
+  );
+}
+
 /** Split a JWT into header / payload / signature for the viewer tab. */
 function decodeJwt(token: string): { header: any; payload: any; signature: string } | null {
   try {
@@ -188,14 +260,17 @@ export default function App() {
     // 2. Client-side Password Blinding
     addLog('ブラウザ内でパスワードを目隠し暗号化: A = r * H1(pw) (Ristretto255群)...');
     addLog(`生のパスワード "${'*'.repeat(password.length)}" はネットワークに一度も流れません。`);
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, 900));
 
     // 3. Relay to distributed nodes
     setNodes((prev) => prev.map((n) => ({ ...n, state: 'sending' })));
     addLog('目隠しされた点 A を分散IdPの定足数ノード (t=2 / n=3) へ中継送信中...');
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, 900));
     setNodes((prev) => prev.map((n) => ({ ...n, state: 'evaluating' })));
     addLog('各ノードがパスワードを検証することなく 2HashTDH 部分評価値 B_i = k_i * A を計算中...');
+    // Hold on the amber "評価中" state so the node animation is legible before the SDK
+    // call (which then drives encrypted -> success through onEvent).
+    await new Promise((r) => setTimeout(r, 800));
 
     try {
       const { assertion } = await client.signOn({
@@ -209,16 +284,16 @@ export default function App() {
       addLog('クライアント端末で暗号文 ct_i を復号成功（正しいパスワード所持の暗号学的証明）！');
       addLog('ラグランジュ補間係数を用いてFROST Schnorr署名を集約: z = sum(z_i)');
       addLog('認可コードとなる認証アサーション (30秒有効, aud=gateway) が完成しました！');
-      addLog(`rp の ${oauthRedirectUri} へ code=<assertion> で遷移します…`);
+      addLog(`準備ができたら rp の ${oauthRedirectUri} へ code=<assertion> で戻ってください。`);
 
       setAssertion(assertion);
       setDecodedToken(decodeJwt(assertion));
       setNodes((prev) => prev.map((n) => ({ ...n, state: 'success' })));
       setStep('completed');
 
-      // Section 14.1 step 7: hand the code back to the rp. Only on success -- a wrong
-      // password throws above and never reaches this redirect.
-      redirectToRpWithCode(assertion);
+      // Section 14.1 step 7: the code goes back to the rp only when the presenter presses
+      // the button below -- no auto-redirect. A wrong password throws above and never
+      // reaches the completed screen.
     } catch (err) {
       const message = describeFailure(err);
       addLog(message);
@@ -266,12 +341,21 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-2">
+          <span className="hidden sm:inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-violet-950/50 text-violet-300 border border-violet-700/50">
+            <span className="w-1.5 h-1.5 mr-1.5 rounded-full bg-violet-400"></span>
+            IdP · 分散認証基盤 · localhost:3000
+          </span>
           <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-950/60 text-emerald-400 border border-emerald-800/40">
             <span className="w-1.5 h-1.5 mr-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-            t = 2 / n = 3 定足数 正常稼働中
+            t = 2 / n = 3 定足数
           </span>
         </div>
       </header>
+
+      {/* Cross-origin flow progress — this page is the IdP authentication stage. */}
+      <div className="border-b border-slate-800 bg-[#0b1120]/60 px-4 py-4">
+        <FlowStepper current={step === 'completed' ? 3 : 2} />
+      </div>
 
       {/* Main Container */}
       <main className="flex-1 max-w-5xl w-full mx-auto px-4 py-8 flex flex-col items-center justify-center">
@@ -438,6 +522,24 @@ export default function App() {
               </div>
             )}
 
+            {step === 'completed' && !isMockView && assertion && (
+              <div className="p-4 rounded-xl bg-blue-950/40 border border-blue-700/50 text-sm text-blue-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <span className="flex items-start gap-2 leading-relaxed">
+                  <CheckCircle2 className="w-4 h-4 text-blue-300 flex-shrink-0 mt-0.5" />
+                  認可コード (認証アサーション) が完成しました。準備ができたら連携先
+                  <span className="font-semibold text-white"> RP · localhost:3001 </span>
+                  へ戻ってください。
+                </span>
+                <button
+                  onClick={() => redirectToRpWithCode(assertion)}
+                  className="py-2.5 px-5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold text-sm transition flex items-center justify-center gap-2 shadow-lg shadow-blue-600/30 whitespace-nowrap"
+                >
+                  <ArrowRight className="w-4 h-4" />
+                  連携先 RP へ戻る
+                </button>
+              </div>
+            )}
+
             {/* Top Status Card */}
             <div className="glass-panel p-6 rounded-2xl cyber-glow">
               <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
@@ -480,6 +582,10 @@ export default function App() {
               {/* Tab 1: Visualizer */}
               {activeTab === 'visualizer' && (
                 <div className="space-y-6">
+                  <p className="text-[11px] text-slate-400 leading-relaxed flex items-start gap-2">
+                    <Lock className="w-3.5 h-3.5 text-violet-400 flex-shrink-0 mt-0.5" />
+                    各ノードはパスワードの正誤を検証しません。目隠しされた点を部分評価し、暗号化した署名シェアを返すだけです。認証の成否はこの端末の中でだけ決まります。
+                  </p>
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                     {nodes.map((n) => (
                       <div

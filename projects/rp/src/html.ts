@@ -25,6 +25,112 @@ export function escapeHtml(value: unknown): string {
     .replace(/'/g, "&#39;");
 }
 
+/**
+ * The one journey the audience follows, shared verbatim with the IdP demo UI
+ * (projects/demo/src/App.tsx `FLOW_STEPS`). Six stages across two origins: the rp front
+ * end (localhost:3001) owns stages 1 and 4-6, the IdP (localhost:3000) owns 2-3.
+ */
+const FLOW_STEPS: { label: string; sub: string; origin: "rp" | "idp" }[] = [
+  { label: "ログイン開始", sub: "localhost:3001", origin: "rp" },
+  { label: "IdP で認証", sub: "PASTA", origin: "idp" },
+  { label: "アサーション発行", sub: "code", origin: "idp" },
+  { label: "RP へ戻る", sub: "redirect", origin: "rp" },
+  { label: "トークン交換", sub: "DPoP", origin: "rp" },
+  { label: "トークン取得", sub: "access_token", origin: "rp" },
+];
+
+/**
+ * Renders the cross-origin progress bar as static markup. `current` is the 1-based stage
+ * this page is on; earlier stages are `done`, later ones `upcoming`. Each step carries an
+ * `id="flow-step-N"` and a `data-flow-state`, so the callback page's inline JS can advance the
+ * highlight from "交換中" to "取得" without a re-render. The marker hue names the owning
+ * origin (rp = blue, IdP = violet), matching the demo UI's stepper.
+ */
+export function renderStepper(current: number, errorAt?: number): string {
+  const items = FLOW_STEPS.map((s, i) => {
+    const n = i + 1;
+    const state =
+      errorAt !== undefined && n === errorAt
+        ? "error"
+        : n < current
+        ? "done"
+        : n === current
+        ? "current"
+        : "upcoming";
+    return (
+      `<li class="flow-step ${s.origin}" data-flow-state="${state}" id="flow-step-${n}">` +
+      `<span class="flow-line"></span>` +
+      `<span class="flow-marker">${state === "done" ? "✓" : String(n)}</span>` +
+      `<span class="flow-label">${escapeHtml(s.label)}</span>` +
+      `<span class="flow-sub">${escapeHtml(s.sub)}</span>` +
+      `</li>`
+    );
+  }).join("");
+  return `<nav class="flow-nav" aria-label="フロー全体の進行"><ol class="flow-steps">${items}</ol></nav>`;
+}
+
+/** An origin badge so the audience always knows which service this page belongs to. */
+export function renderOriginBadge(): string {
+  return `<span class="origin-badge">RP · 連携先サービス · localhost:3001</span>`;
+}
+
+/** Stepper + origin-badge styles. Light theme, structurally identical to the demo UI. */
+const STEPPER_STYLE = `
+    .origin-badge {
+      display: inline-flex; align-items: center; gap: 0.4rem;
+      font-size: 0.75rem; font-weight: 600; color: #1d4ed8;
+      background: #eff6ff; border: 1px solid #bfdbfe;
+      padding: 0.25rem 0.7rem; border-radius: 100px;
+    }
+    .origin-badge::before {
+      content: ""; width: 6px; height: 6px; border-radius: 50%; background: #3b82f6;
+    }
+    .flow-nav { width: 100%; background: #fff; border-bottom: 1px solid #e2e8f0; padding: 1.1rem 1rem; }
+    .flow-steps {
+      list-style: none; margin: 0 auto; padding: 0; max-width: 760px;
+      display: flex; align-items: flex-start;
+    }
+    .flow-step {
+      position: relative; flex: 1; min-width: 0;
+      display: flex; flex-direction: column; align-items: center; text-align: center;
+    }
+    .flow-line {
+      position: absolute; top: 15px; right: 50%; width: 100%; height: 2px;
+      background: #e2e8f0; z-index: 0;
+    }
+    .flow-step:first-child .flow-line { display: none; }
+    .flow-marker {
+      position: relative; z-index: 1;
+      width: 32px; height: 32px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.8125rem; font-weight: 700;
+      background: #fff; border: 1px solid #cbd5e1; color: #94a3b8;
+      transition: all 0.2s;
+    }
+    .flow-label { margin-top: 0.5rem; font-size: 0.75rem; line-height: 1.2; color: #94a3b8; padding: 0 0.2rem; }
+    .flow-sub { margin-top: 0.15rem; font-size: 0.625rem; font-family: ui-monospace, monospace; color: #cbd5e1; }
+    /* Completed: the connector into this step is filled. */
+    .flow-step[data-flow-state="done"] .flow-line,
+    .flow-step[data-flow-state="current"] .flow-line { background: #94a3b8; }
+    .flow-step[data-flow-state="done"] .flow-label,
+    .flow-step[data-flow-state="current"] .flow-label { color: #334155; }
+    .flow-step[data-flow-state="current"] .flow-label { font-weight: 700; }
+    /* Origin hues: rp = blue, IdP = violet. */
+    .flow-step.rp[data-flow-state="done"] .flow-marker { background: #eff6ff; border-color: #93c5fd; color: #2563eb; }
+    .flow-step.idp[data-flow-state="done"] .flow-marker { background: #f5f3ff; border-color: #c4b5fd; color: #7c3aed; }
+    .flow-step.rp[data-flow-state="current"] .flow-marker {
+      background: #2563eb; border-color: #2563eb; color: #fff;
+      box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.15);
+    }
+    .flow-step.idp[data-flow-state="current"] .flow-marker {
+      background: #7c3aed; border-color: #7c3aed; color: #fff;
+      box-shadow: 0 0 0 4px rgba(124, 58, 237, 0.15);
+    }
+    .flow-step[data-flow-state="error"] .flow-marker {
+      background: #fef2f2; border-color: #fca5a5; color: #dc2626;
+    }
+    .flow-step[data-flow-state="error"] .flow-label { color: #b91c1c; font-weight: 700; }`;
+
 const SHARED_HEAD_STYLE = `
     *, *::before, *::after { box-sizing: border-box; }
     body {
@@ -652,7 +758,7 @@ export function renderLandingPage(params: LandingParams): string {
 <head>
   <meta charset="utf-8">
   <title>ZK-App Portal</title>
-  <style>${SHARED_HEAD_STYLE}
+  <style>${SHARED_HEAD_STYLE}${STEPPER_STYLE}
     header nav a { color: #64748b; text-decoration: none; font-size: 0.875rem; margin-left: 1.5rem; }
     header nav a:hover { color: #1e293b; }
     main {
@@ -715,8 +821,13 @@ export function renderLandingPage(params: LandingParams): string {
       cursor: progress;
       pointer-events: none;
     }
+    .dpop-details { margin-top: 2.5rem; max-width: 520px; width: 100%; }
+    .dpop-details summary {
+      color: #94a3b8; font-size: 0.8125rem; cursor: pointer; text-align: center;
+      list-style-position: inside;
+    }
     .dpop {
-      margin-top: 1.75rem;
+      margin-top: 0.75rem;
       font-size: 0.8125rem;
       color: #475569;
       background: #fff;
@@ -731,19 +842,21 @@ export function renderLandingPage(params: LandingParams): string {
       color: #1e293b;
       word-break: break-all;
     }
-    .dpop .reason { display: block; margin-top: 0.5rem; color: #b91c1c; }
-    .dpop .reason:empty { display: none; }
+    .reason { display: block; margin-top: 1rem; color: #b91c1c; font-size: 0.8125rem; }
+    .reason:empty { display: none; }
   </style>
 </head>
 <body>
   <header>
     <span class="logo">ZK-App Portal</span>
+    ${renderOriginBadge()}
     <nav>
       <a href="#">機能</a>
       <a href="#">料金</a>
       <a href="#">ドキュメント</a>
     </nav>
   </header>
+  ${renderStepper(1)}
   <main>
     <div class="hero">
       <span class="badge">分散型 ID 対応サービス</span>
@@ -756,18 +869,19 @@ export function renderLandingPage(params: LandingParams): string {
         <svg width="18" height="18" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
           <path stroke-linecap="round" stroke-linejoin="round" d="M15 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0zM3 20a9 9 0 0 1 18 0"/>
         </svg>
-        <span id="login-label">DPoP 鍵を準備中...</span>
+        <span id="login-label">ログインの準備中...</span>
       </a>
-      <div class="dpop">
-        my DPoP jkt: <code id="dpop-jkt">(生成中)</code>
-        <span class="reason" id="dpop-reason"></span>
-      </div>
+      <span class="reason" id="dpop-reason"></span>
     </div>
     <div class="features">
       <div class="feature"><strong>秘密分散鍵</strong>単一障害点なし</div>
       <div class="feature"><strong>ゼロ知識プロキシ</strong>AS はトークンを持たない</div>
       <div class="feature"><strong>標準 OAuth + DPoP</strong>RP 側の改修不要</div>
     </div>
+    <details class="dpop-details">
+      <summary>技術詳細 (この端末の DPoP 鍵)</summary>
+      <div class="dpop">my DPoP jkt: <code id="dpop-jkt">(生成中)</code></div>
+    </details>
   </main>
   <footer>ZK-App Portal (RP デモ) — PASTA + FROST + OAuth Proxy</footer>
   <script>${DPOP_SCRIPT}</script>
@@ -805,6 +919,10 @@ const TOKEN_PAGE_SCRIPT = `
   var checksEl = document.getElementById("verify-checks");
   var claimsEl = document.getElementById("token-claims");
   var refreshBtn = document.getElementById("refresh-btn");
+  var bindingNote = document.getElementById("binding-note");
+  var userSubEl = document.getElementById("user-sub");
+  var userScopeEl = document.getElementById("user-scope");
+  var boundBadge = document.getElementById("bound-badge");
 
   var material = null;
   var refreshToken = "";
@@ -816,6 +934,17 @@ const TOKEN_PAGE_SCRIPT = `
 
   function setDetail(text) {
     detailEl.textContent = text || "";
+  }
+
+  /** Advance the cross-origin stepper as the token flow reaches its last two stages. */
+  function markStep(n, state) {
+    var el = document.getElementById("flow-step-" + n);
+    if (!el) return;
+    el.setAttribute("data-flow-state", state);
+    if (state === "done") {
+      var marker = el.querySelector(".flow-marker");
+      if (marker) marker.textContent = "✓";
+    }
   }
 
   function fail(text, detail) {
@@ -860,11 +989,25 @@ const TOKEN_PAGE_SCRIPT = `
       ? JSON.stringify(result.verification.payload, null, 2)
       : "(クレームを解析できませんでした)";
     if (result.verification.valid) {
-      setStatus("✓ アクセストークンを取得し、ブラウザ内で検証しました", true);
-      setDetail("署名・iss・aud・exp・cnf.jkt をすべてこのページで確認しています。");
-    } else {
-      setStatus("✖ トークン検証に失敗しました: " + result.verification.error, false);
+      var claims = result.verification.payload || {};
+      if (userSubEl) userSubEl.textContent = claims.sub ? String(claims.sub) : "(不明)";
+      var shownScope = tokens.scope
+        ? String(tokens.scope)
+        : claims.scope
+        ? String(claims.scope)
+        : "(なし)";
+      if (userScopeEl) userScopeEl.textContent = shownScope;
+      if (boundBadge) boundBadge.hidden = false;
+      setStatus("✓ ログインしました", true);
       setDetail("");
+      markStep(5, "done");
+      markStep(6, "current");
+      if (bindingNote) bindingNote.hidden = false;
+    } else {
+      if (boundBadge) boundBadge.hidden = true;
+      setStatus("✖ ログインに失敗しました: " + result.verification.error, false);
+      setDetail("");
+      if (bindingNote) bindingNote.hidden = true;
     }
   }
 
@@ -993,7 +1136,33 @@ const CALLBACK_STYLE = `
     button:disabled { background: #cbd5e1; color: #64748b; cursor: not-allowed; }
     .back { display: inline-block; margin-top: 1.5rem; margin-right: 1.25rem; color: #6366f1; font-size: 0.875rem; font-weight: 500; text-decoration: none; }
     .back:hover { text-decoration: underline; }
-    .note { font-size: 0.75rem; color: #94a3b8; margin-top: 1rem; line-height: 1.5; }`;
+    .note { font-size: 0.75rem; color: #94a3b8; margin-top: 1rem; line-height: 1.5; }
+    .binding {
+      margin-top: 1.25rem; padding: 0.875rem 1rem;
+      background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px;
+      font-size: 0.8125rem; color: #166534; line-height: 1.6;
+    }
+    .binding strong { display: block; color: #15803d; margin-bottom: 0.2rem; }
+    .welcome { display: flex; align-items: center; gap: 0.875rem; margin-bottom: 1.25rem; }
+    .welcome-icon {
+      width: 40px; height: 40px; border-radius: 50%; flex-shrink: 0;
+      background: #dcfce7; color: #16a34a;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.25rem; font-weight: 700;
+    }
+    .welcome-title { font-size: 1.25rem; color: #0f172a; margin: 0; font-weight: 700; }
+    .welcome-lead { margin: 0.15rem 0 0; font-size: 0.875rem; color: #64748b; }
+    .user-info { margin-bottom: 1rem; }
+    .bound-badge {
+      display: inline-flex; align-items: center; gap: 0.4rem;
+      font-size: 0.8125rem; font-weight: 600; color: #15803d;
+      background: #f0fdf4; border: 1px solid #bbf7d0;
+      padding: 0.35rem 0.8rem; border-radius: 100px;
+    }
+    .tech { margin-top: 1.5rem; border-top: 1px solid #e2e8f0; padding-top: 0.5rem; }
+    .tech > summary { color: #64748b; font-weight: 600; }
+    .tech-body { padding-top: 0.25rem; }
+    .tech h3 { font-size: 0.9375rem; color: #334155; margin: 1.25rem 0 0.5rem; font-weight: 700; }`;
 
 /**
  * The post-redirect page. The server fills in nothing but the five `data-` attributes;
@@ -1005,14 +1174,16 @@ export function renderCallbackPage(params: CallbackParams): string {
 <head>
   <meta charset="utf-8">
   <title>ZK-App Portal - トークン取得</title>
-  <style>${SHARED_HEAD_STYLE}${CALLBACK_STYLE}
+  <style>${SHARED_HEAD_STYLE}${STEPPER_STYLE}${CALLBACK_STYLE}
   </style>
 </head>
 <body>
   <header>
     <span class="logo">ZK-App Portal</span>
+    ${renderOriginBadge()}
     <span style="font-size:0.8125rem;color:#64748b">OAuth 2.0 authorization code + DPoP</span>
   </header>
+  ${renderStepper(5)}
   <main id="token-flow"
         data-code="${escapeHtml(params.code)}"
         data-state="${escapeHtml(params.state)}"
@@ -1024,34 +1195,61 @@ export function renderCallbackPage(params: CallbackParams): string {
       <p class="detail" id="flow-detail"></p>
 
       <div id="flow-result" hidden>
-        <h2>アクセストークン</h2>
-        <table>
-          <tr><th>access_token</th><td id="access-token"></td></tr>
-          <tr><th>token_type</th><td id="token-type"></td></tr>
-          <tr><th>expires_in</th><td id="expires-in"></td></tr>
-          <tr><th>scope</th><td id="token-scope"></td></tr>
-          <tr><th>refresh_token</th><td id="refresh-token"></td></tr>
-          <tr><th>my DPoP jkt (この端末)</th><td id="my-dpop-jkt">(読み出し中)</td></tr>
+        <div class="welcome">
+          <div class="welcome-icon">✓</div>
+          <div>
+            <h2 class="welcome-title">ZK-App Portal にログインしました</h2>
+            <p class="welcome-lead">PASTA IdP での認証が完了し、アカウントが連携されました。</p>
+          </div>
+        </div>
+
+        <table class="user-info">
+          <tr><th>ユーザー</th><td id="user-sub">(取得中)</td></tr>
+          <tr><th>許可されたスコープ</th><td id="user-scope">(取得中)</td></tr>
         </table>
 
-        <h2>ブラウザ内での検証</h2>
-        <ul class="checks" id="verify-checks"></ul>
+        <span class="bound-badge" id="bound-badge" hidden>🔒 このログインはこの端末に束縛されています (DPoP)</span>
 
-        <details>
-          <summary>クレーム (生データ)</summary>
-          <pre id="token-claims"></pre>
+        <details class="tech">
+          <summary>技術詳細 (DPoP 束縛の検証)</summary>
+          <div class="tech-body">
+            <h3>アクセストークン</h3>
+            <table>
+              <tr><th>access_token</th><td id="access-token"></td></tr>
+              <tr><th>token_type</th><td id="token-type"></td></tr>
+              <tr><th>expires_in</th><td id="expires-in"></td></tr>
+              <tr><th>scope</th><td id="token-scope"></td></tr>
+              <tr><th>refresh_token</th><td id="refresh-token"></td></tr>
+              <tr><th>my DPoP jkt (この端末)</th><td id="my-dpop-jkt">(読み出し中)</td></tr>
+            </table>
+
+            <h3>ブラウザ内での検証</h3>
+            <ul class="checks" id="verify-checks"></ul>
+
+            <div id="binding-note" class="binding" hidden>
+              <strong>cnf.jkt がこの端末の DPoP 鍵と一致 — このトークンは私に束縛されています。</strong>
+              gateway とノードはこの access_token を中継・合成で見ましたが、対応する DPoP 秘密鍵を
+              持たないため行使できません。トークンを使えるのはこの鍵を持つブラウザだけです。
+            </div>
+
+            <details>
+              <summary>クレーム (生データ)</summary>
+              <pre id="token-claims"></pre>
+            </details>
+
+            <button id="refresh-btn" type="button" disabled>アクセストークンをリフレッシュ</button>
+
+            <p class="note">
+              rp サーバーは HTML を返しただけです。<code>/token</code> の呼び出し、DPoP proof の署名、
+              JWKS の取得と Ed25519 検証はすべてこのページの JavaScript が行っています。<br>
+              受け取った認可コードは認証アサーション (ノードのグループ署名 JWT) そのもので、rp は
+              中身を解釈せずそのまま <code>/token</code> に渡します。検証するのは gateway とノードです。<br>
+              DPoP 秘密鍵は extractable=false でこのオリジンの IndexedDB にあり、サーバーには渡りません。
+            </p>
+          </div>
         </details>
       </div>
 
-      <button id="refresh-btn" type="button" disabled>リフレッシュ</button>
-
-      <p class="note">
-        rp サーバーは HTML を返しただけです。<code>/token</code> の呼び出し、DPoP proof の署名、
-        JWKS の取得と Ed25519 検証はすべてこのページの JavaScript が行っています。<br>
-        受け取った認可コードは認証アサーション (ノードのグループ署名 JWT) そのもので、rp は
-        中身を解釈せずそのまま <code>/token</code> に渡します。検証するのは gateway とノードです。<br>
-        DPoP 秘密鍵は extractable=false でこのオリジンの IndexedDB にあり、サーバーには渡りません。
-      </p>
       <a class="back" href="/">← ZK-App Portal トップに戻る</a>
       <a class="back" href="${escapeHtml(params.issuer)}/demo">デモ画面に戻る</a>
     </div>
@@ -1093,11 +1291,15 @@ export function renderCallbackErrorPage(params: CallbackErrorParams): string {
 <head>
   <meta charset="utf-8">
   <title>ZK-App Portal - 認可失敗</title>
-  <style>${SHARED_HEAD_STYLE}${CALLBACK_STYLE}
+  <style>${SHARED_HEAD_STYLE}${STEPPER_STYLE}${CALLBACK_STYLE}
   </style>
 </head>
 <body>
-  <header><span class="logo">ZK-App Portal</span></header>
+  <header>
+    <span class="logo">ZK-App Portal</span>
+    ${renderOriginBadge()}
+  </header>
+  ${renderStepper(3, 3)}
   <main>
     <div class="card">
       <div class="banner ng">✖ 認可に失敗しました</div>
