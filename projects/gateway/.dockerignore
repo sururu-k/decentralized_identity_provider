@@ -1,0 +1,11 @@
+node_modules
+dist
+tests
+vitest.config.ts
+README.md
+Dockerfile
+.dockerignore
+.git
+.gitignore
+*.log
+.DS_Store

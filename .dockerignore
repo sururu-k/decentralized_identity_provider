@@ -1,0 +1,46 @@
+# Build context for the gateway image is the repository root, because that image also
+# builds projects/demo/ (docs/container-split.md section 6). Everything below is either
+# rebuilt inside the image, belongs to another component, or must never reach a layer.
+
+# Dependencies and build output are reinstalled/rebuilt in the image.
+node_modules
+**/node_modules
+dist
+**/dist
+
+# Other components build from their own directories.
+projects/dealer
+projects/node
+projects/rp
+
+# The old monolith (src/, tests/) has been removed from the repository; these entries
+# are harmless if the paths don't exist. `**/tests` also excludes each component's own
+# tests/ directory from build contexts that use the repo root (gateway).
+src
+tests
+**/tests
+
+# Key material. The dealer writes it at runtime and it is mounted, never copied in.
+secrets
+*.pem
+*.key
+.env
+.env.*
+
+# Docs, images and repository metadata.
+.git
+.gitignore
+.github
+docs
+pic
+*.md
+
+# Editor and OS noise.
+.idea
+.vscode
+.claude
+.DS_Store
+._*
+*.swp
+*~
+*.log

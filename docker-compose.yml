@@ -1,0 +1,98 @@
+# PASTA / FROST 分散 IdP — 全コンポーネント起動
+#
+#   mkdir -p secrets && docker compose up -d --build --wait
+#
+# 契約は docs/container-split.md 第 2 節 (ポート) と第 8 節 (compose)。
+# 鍵を作り直すときは `docker compose down && rm -rf secrets` の後で再度 up する。
+
+services:
+  # 鍵配布 (one-shot)。nodes/gateway が読む secrets/ を書き出して終了する。
+  # --if-missing があるので 2 回目以降の up では何も書かず exit 0 になり、鍵は保持される。
+  dealer:
+    build: ./projects/dealer
+    image: pasta-dealer
+    command: ["--out", "/secrets", "--if-missing"]
+    volumes:
+      - ./secrets:/secrets
+    restart: "no"
+
+  # node1..3 は同一イメージ。`image:` を揃えてあるので compose は 1 回しかビルドしない。
+  # HEALTHCHECK は Dockerfile 側 (5s 間隔) をそのまま使う。
+  node1:
+    build: ./projects/node
+    image: pasta-node
+    environment:
+      NODE_CONFIG: /secrets/node-1.json
+      PORT: "4001"
+    ports:
+      - "4001:4001"
+    volumes:
+      - ./secrets:/secrets:ro
+    depends_on:
+      dealer:
+        condition: service_completed_successfully
+
+  node2:
+    build: ./projects/node
+    image: pasta-node
+    environment:
+      NODE_CONFIG: /secrets/node-2.json
+      PORT: "4002"
+    ports:
+      - "4002:4002"
+    volumes:
+      - ./secrets:/secrets:ro
+    depends_on:
+      dealer:
+        condition: service_completed_successfully
+
+  node3:
+    build: ./projects/node
+    image: pasta-node
+    environment:
+      NODE_CONFIG: /secrets/node-3.json
+      PORT: "4003"
+    ports:
+      - "4003:4003"
+    volumes:
+      - ./secrets:/secrets:ro
+    depends_on:
+      dealer:
+        condition: service_completed_successfully
+
+  # ビルドコンテキストはリポジトリルート。projects/demo/ の React UI を同じイメージに焼くため
+  # (docs/container-split.md 第 6 節)。
+  gateway:
+    build:
+      context: .
+      dockerfile: projects/gateway/Dockerfile
+    image: pasta-gateway
+    environment:
+      ISSUER: http://localhost:3000 # ブラウザから見える URL = JWT の iss
+      NODE_URLS: http://node1:4001,http://node2:4002,http://node3:4003
+      GROUP_CONFIG: /secrets/group.json
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./secrets:/secrets:ro
+    depends_on:
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+      node3:
+        condition: service_healthy
+
+  # RP (ZK-App Portal)。検証鍵は gateway の JWKS からしか取らない。
+  rp:
+    build: ./projects/rp
+    image: pasta-rp
+    environment:
+      ISSUER: http://localhost:3000 # iss 検証と /authorize の組み立て
+      IDP_INTERNAL_URL: http://gateway:3000 # サーバ側の JWKS 取得先
+      RP_BASE_URL: http://localhost:3001 # redirect_uri = ${RP_BASE_URL}/callback
+    ports:
+      - "3001:3001"
+    depends_on:
+      gateway:
+        condition: service_healthy
