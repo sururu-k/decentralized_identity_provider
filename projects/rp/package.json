@@ -1,7 +1,7 @@
 {
   "name": "pasta-rp",
   "version": "0.1.0",
-  "description": "ZK-App Portal — Relying Party for the PASTA distributed IdP (OIDC form_post, JWKS-only verification)",
+  "description": "ZK-App Portal — Relying Party for the PASTA distributed IdP (OAuth 2.0 authorization code + DPoP, browser-side token exchange)",
   "type": "module",
   "private": true,
   "main": "dist/index.js",

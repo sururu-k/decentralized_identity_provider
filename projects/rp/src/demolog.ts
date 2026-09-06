@@ -3,10 +3,13 @@
  *
  * `docs/container-split.md` section 10: every component in the demo emits the same
  * compact one-or-two-line shape to stdout, in English, so an audience watching the
- * node / gateway / rp / browser columns side by side can see that only the browser ever
- * assembles a full `id_token` — the rp only ever sees the finished token over form_post
- * and the IdP's *public* signing key. What the rp cannot hold is stated once, on the
- * `● up` line, as `never:`; no later event repeats it.
+ * node / gateway / rp / browser columns side by side can see who can assemble what.
+ *
+ * Since the OAuth step (section 14) the rp *server* is the thinnest column of all. It
+ * builds an `/authorize` URL, and it serves the callback HTML. It never sees the
+ * authorization code turn into a token: the browser posts to `/token` itself, with a DPoP
+ * proof made from a key the server has never held. That is what the `never:` line on
+ * `● up` says, and no later event repeats it.
  *
  * This module owns formatting only. `server.ts` decides what values go where; it never
  * has to duplicate the column widths, the truncation rule, or the `never:` wording.
@@ -54,30 +57,34 @@ function colorize(line: string, bold: boolean): string {
 
 /**
  * Truncates a value to its first 8 characters, with no ellipsis (section 10).
- * Session-scoped, single-use values (`id_token`, …) are shown this way; long-term secrets
- * are never passed to this function in the first place — there is nothing in this process
- * that qualifies (rp holds no keys at all).
+ * The authorization code is a session-scoped, single-use value and is shown this way;
+ * long-term secrets are never passed to this function in the first place — there is
+ * nothing in this process that qualifies (rp holds no keys at all).
  */
 export function truncate8(value: string): string {
   return value.slice(0, 8);
 }
 
 /**
- * The `never:` text of the `● up` line. A constant (section 10): the audience compares it
- * across columns, and it is the only place the rp makes the claim.
+ * The `holds:` text of the `● up` line. Public configuration and nothing else: since the
+ * token exchange moved into the browser, the rp server keeps no key material and no
+ * cache.
  */
-export const NEVER_HELD = "pw, A, B_i, ct_i, any node traffic";
+export const HELD = "nothing (HTML only)";
+
+/**
+ * The `never:` text of the `● up` line. A constant (section 10): the audience compares it
+ * across columns, and it is the only place the rp makes the claim. `access_token` is on
+ * the list because the browser calls `/token` directly — the token never reaches this
+ * process, not even in a request it proxies.
+ */
+export const NEVER_HELD =
+  "pw, A, B_i, ct_i, any node traffic, access_token (handled in browser only)";
 
 /** First line of an event: tag, event name in its own column, then the content. */
 function head(event: string, text: string): void {
   if (!demoLogEnabled()) return;
   console.log(colorize(`${TAG} ${event.padEnd(EVENT_WIDTH)} ${text}`, true));
-}
-
-/** Continuation line: the same width of blanks, so the columns line up. */
-function cont(text: string): void {
-  if (!demoLogEnabled()) return;
-  console.log(colorize(`${CONTINUATION_INDENT}${text}`, false));
 }
 
 /** A refusal: one line, the reason verbatim. */
@@ -87,105 +94,58 @@ function reject(event: string, reason: string): void {
 }
 
 export interface StartupLogParams {
-  /** The IdP this RP trusts. Public configuration. */
+  /** The authorization server this RP points the browser at. Public configuration. */
   issuer: string;
 }
 
 /** Process start: the one place the `holds:` / `never:` claim is made. */
 export function logStartup(params: StartupLogParams): void {
-  head(
-    "● up",
-    `issuer=${params.issuer}   holds: JWKS(kid) only   never: ${NEVER_HELD}`
-  );
+  head("● up", `issuer=${params.issuer}   holds: ${HELD}   never: ${NEVER_HELD}`);
 }
 
 export interface LandingLogParams {
   /**
-   * The nonce just generated for the outgoing `/authorize` URL. Shown in full (section
-   * 10): the OIDC `nonce` is a public correlation id, not cryptographic byte material,
-   * and truncating it would make it useless for tracing one login across the log columns.
+   * The `state` just generated for the outgoing `/authorize` URL. Shown in full (section
+   * 10): it is a public correlation id, not cryptographic byte material, and truncating
+   * it would make it useless for tracing one login across the log columns.
    */
-  nonce: string;
-  /** The state just generated for the outgoing `/authorize` URL. Shown in full: it is not a secret. */
   state: string;
 }
 
-/** `GET /`: the landing page hands the browser a fresh nonce/state pair. */
+/** `GET /`: the landing page hands the browser a fresh `state` for the code flow. */
 export function logLanding(params: LandingLogParams): void {
-  head("landing", `nonce=${params.nonce} state=${params.state}  → authorize URL`);
+  head("landing", `state=${params.state}  → authorize URL`);
 }
-
-/**
- * How `/callback` ended up, in enough detail to render the second line and, on anything
- * but success, the `✖` line instead of it.
- */
-export type CallbackOutcome =
-  | {
-      kind: "verified";
-      kid: string;
-      iss: string;
-      aud: string;
-      expRemainingSeconds: number;
-      sub: string;
-    }
-  | { kind: "verification_failed"; kid: string | undefined; reason: string }
-  | { kind: "jwks_unreachable"; kid: string | undefined; reason: string }
-  | { kind: "parse_failed"; reason: string };
 
 export interface CallbackLogParams {
-  /** The raw `id_token` from the form_post body, truncated to 8 chars for display. */
-  idToken: string;
-  /** The `state` echoed by the form_post body, shown in full (display-only, never a secret). */
+  /**
+   * The authorization code from the query string, truncated to 8 chars for display.
+   *
+   * Since the section 14 revision this is not an opaque handle but the authentication
+   * assertion itself — the group-signed JWT the browser assembled at the IdP front end.
+   * The log says `code(assertion)` so the audience can see that what travels through the
+   * rp is a signed statement the rp cannot have produced, not a database key.
+   */
+  code: string;
+  /** The `state` echoed by the authorization server. Shown in full; the browser checks it. */
   state: string | undefined;
-  /** Where the JWKS was (or would have been) fetched from. */
-  idpInternalUrl: string;
-  outcome: CallbackOutcome;
-}
-
-function formatKid(kid: string | undefined): string {
-  return kid ?? "?";
 }
 
 /**
- * `POST /callback`: the browser's finished `id_token` arrives over form_post.
+ * `GET /callback`: the browser comes back from the authorization server with a code.
  *
- * Success is two lines: what arrived, then what the RP checked with the IdP's public key.
- * A refusal keeps the first line — the audience still sees what arrived — and replaces
- * the second with the shared `✖ <event> rejected: <reason>` line (section 10).
+ * One line, because that is the whole of the server's involvement. It hands out a page
+ * whose inline script does the `/token` call; the code is spent in the browser, not here.
  */
 export function logCallback(params: CallbackLogParams): void {
   head(
     "callback",
-    `state=${params.state ?? "-"}  ← id_token ${truncate8(params.idToken)} ` +
-      `(direct from browser, not via gateway)`
+    `state=${params.state ?? "-"}  ← code(assertion) ${truncate8(params.code)} ` +
+      `(query, via browser redirect)  → page with token script`
   );
-
-  const outcome = params.outcome;
-  switch (outcome.kind) {
-    case "parse_failed":
-      reject("callback", `JWT parse failed before JWKS lookup: ${outcome.reason}`);
-      return;
-    case "jwks_unreachable":
-      reject(
-        "callback",
-        `JWKS(kid=${formatKid(outcome.kid)}) unreachable at ${params.idpInternalUrl}: ${outcome.reason}`
-      );
-      return;
-    case "verification_failed":
-      reject("callback", outcome.reason);
-      return;
-    case "verified":
-      cont(
-        `JWKS kid=${outcome.kid} → Ed25519 ✓  iss ✓  aud ✓  ` +
-          `exp ${outcome.expRemainingSeconds}s  sub=${outcome.sub}`
-      );
-  }
 }
 
-/**
- * JWKS fetch (first request or a kid-triggered refetch). Public information only, so a
- * single line.
- */
-export function logJwksFetch(): void {
-  head("jwks", "public only");
+/** `GET /callback` with no usable code: the authorization server's error, or a bad URL. */
+export function logCallbackRejected(reason: string): void {
+  reject("callback", reason);
 }

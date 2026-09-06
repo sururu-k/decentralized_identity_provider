@@ -1,845 +1,341 @@
-import crypto from "node:crypto";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { configFromEnv, DEFAULT_PORT, portFromEnv } from "../src/config.js";
-import { createRpServer } from "../src/server.js";
+import {
+  configFromEnv,
+  DEFAULT_CLIENT_ID,
+  DEFAULT_ISSUER,
+  DEFAULT_PORT,
+  DEFAULT_RP_BASE_URL,
+  portFromEnv,
+} from "../src/config.js";
+import { buildAuthorizeUrl, createRpServer, redirectUriFor } from "../src/server.js";
 
 /**
- * Component e2e tests. Everything below goes over real HTTP: a fake JWKS server
- * stands in for the gateway, and the RP is started on port 0 pointed at it.
+ * Component tests for the rp server, over real HTTP.
  *
- * The signing key is generated here with node:crypto — the tests share no code
- * with the IdP, which is the point of the RP being a standalone verifier.
+ * Since the OAuth step (docs/container-split.md section 14) the server is three GET
+ * routes and no state: it builds an `/authorize` URL, and it serves the callback page
+ * with the code and state escaped into `data-` attributes. It never calls `/token`, never
+ * fetches JWKS and never touches a key, so there is no authorization server to fake here.
+ * The behaviour that used to need one now lives in the browser, and
+ * `tests/token-script.test.ts` runs it under Node's WebCrypto against a fake gateway.
  */
 
 const ISSUER = "http://idp.example.test";
+const RP_BASE_URL = "http://rp.example.test";
 const CLIENT_ID = "demo_client";
-const KID = "pasta-group-key-1";
 
-// ---------------------------------------------------------------------------
-// Test-local JWT signing helpers (independent of the RP implementation)
-// ---------------------------------------------------------------------------
-
-const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
-const otherKeyPair = crypto.generateKeyPairSync("ed25519");
-
-/** base64url without padding — the same shape as the IdP's `base64UrlEncode`. */
-function b64u(input: Buffer | string): string {
-  return (typeof input === "string" ? Buffer.from(input, "utf8") : input).toString("base64url");
-}
-
-function jwkFor(key: crypto.KeyObject, kid: string) {
-  const jwk = key.export({ format: "jwk" }) as { kty: string; crv: string; x: string };
-  return { kty: jwk.kty, crv: jwk.crv, x: jwk.x, kid, use: "sig", alg: "EdDSA" };
-}
-
-interface SignOptions {
-  kid?: string;
-  key?: crypto.KeyObject;
-  header?: Record<string, unknown>;
-}
-
-function signJwt(payload: Record<string, unknown>, options: SignOptions = {}): string {
-  const header = { alg: "EdDSA", typ: "JWT", kid: options.kid ?? KID, ...options.header };
-  const signingInput = `${b64u(JSON.stringify(header))}.${b64u(JSON.stringify(payload))}`;
-  const signature = crypto.sign(null, Buffer.from(signingInput, "ascii"), options.key ?? privateKey);
-  return `${signingInput}.${b64u(signature)}`;
-}
-
-function validPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  const now = Math.floor(Date.now() / 1000);
-  return {
-    iss: ISSUER,
-    sub: "usr_alice_12345",
-    aud: CLIENT_ID,
-    iat: now,
-    exp: now + 3600,
-    nonce: "test_nonce_value",
-    ...overrides,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Fake JWKS server (stands in for the gateway)
-// ---------------------------------------------------------------------------
-
-interface FakeJwks {
+interface RunningRp {
   server: http.Server;
   url: string;
-  /** How many times /jwks.json has been fetched. */
-  hits: number;
-  /** Set to a status code to make the endpoint fail. */
-  failWith: number | null;
-  keys: object[];
 }
 
-function startFakeJwks(): Promise<FakeJwks> {
-  const state: FakeJwks = {
-    server: undefined as unknown as http.Server,
-    url: "",
-    hits: 0,
-    failWith: null,
-    keys: [jwkFor(publicKey, KID)],
-  };
-  state.server = http.createServer((req, res) => {
-    if (req.url !== "/jwks.json") {
-      res.writeHead(404).end();
-      return;
-    }
-    state.hits += 1;
-    if (state.failWith !== null) {
-      res.writeHead(state.failWith, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "unavailable" }));
-      return;
-    }
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ keys: state.keys }));
-  });
-  return new Promise((resolve) => {
-    state.server.listen(0, "127.0.0.1", () => {
-      const { port } = state.server.address() as AddressInfo;
-      state.url = `http://127.0.0.1:${port}`;
-      resolve(state);
-    });
-  });
-}
-
-function startRp(idpInternalUrl: string): Promise<{ server: http.Server; url: string }> {
+function startRp(overrides: Partial<Parameters<typeof createRpServer>[0]> = {}): Promise<RunningRp> {
   const server = createRpServer({
-    rpBaseUrl: "http://rp.example.test:3001",
+    rpBaseUrl: RP_BASE_URL,
     issuer: ISSUER,
-    idpInternalUrl,
     clientId: CLIENT_ID,
+    ...overrides,
   });
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {
-      const { port } = server.address() as AddressInfo;
-      resolve({ server, url: `http://127.0.0.1:${port}` });
+      resolve({ server, url: `http://127.0.0.1:${(server.address() as AddressInfo).port}` });
     });
   });
 }
 
-function closeServer(server: http.Server): Promise<void> {
-  return new Promise((resolve) => server.close(() => resolve()));
+function stop(rp: RunningRp): Promise<void> {
+  return new Promise((resolve) => rp.server.close(() => resolve()));
 }
-
-/**
- * Runs one test against a fresh fake-JWKS + RP pair, tearing both down even when
- * the body throws, so a failing assertion cannot leak a listening socket.
- */
-async function withFreshRp(
-  fn: (ctx: { rp: { server: http.Server; url: string }; jwks: FakeJwks }) => Promise<void>
-): Promise<void> {
-  const jwks = await startFakeJwks();
-  const rp = await startRp(jwks.url);
-  try {
-    await fn({ rp, jwks });
-  } finally {
-    await closeServer(rp.server);
-    await closeServer(jwks.server);
-  }
-}
-
-async function postCallback(rpUrl: string, form: Record<string, string>) {
-  const response = await fetch(`${rpUrl}/callback`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams(form).toString(),
-  });
-  return { status: response.status, html: await response.text() };
-}
-
-// ---------------------------------------------------------------------------
 
 describe("rp component e2e", () => {
-  let jwks: FakeJwks;
-  let rp: { server: http.Server; url: string };
+  let rp: RunningRp;
 
   beforeAll(async () => {
-    jwks = await startFakeJwks();
-    rp = await startRp(jwks.url);
+    rp = await startRp();
   });
 
   afterAll(async () => {
-    await closeServer(rp.server);
-    await closeServer(jwks.server);
+    await stop(rp);
   });
 
   it("GET /health returns ok", async () => {
-    const response = await fetch(`${rp.url}/health`);
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({ status: "ok" });
+    const res = await fetch(`${rp.url}/health`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: "ok" });
   });
 
-  it("GET / renders the landing page with a form_post authorize URL", async () => {
-    const response = await fetch(`${rp.url}/`);
-    expect(response.status).toBe(200);
-    expect(response.headers.get("content-type")).toContain("text/html");
-    const html = await response.text();
+  it("GET / renders the landing page with an authorization-code authorize URL", async () => {
+    const res = await fetch(`${rp.url}/`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const html = await res.text();
 
-    expect(html).toContain("ZK-App Portal");
-    expect(html).toContain("PASTA IdP でログイン");
-    // redirect_uri points back at this RP's /callback, percent-encoded.
-    expect(html).toContain("redirect_uri=http%3A%2F%2Frp.example.test%3A3001%2Fcallback");
-    expect(html).toContain("response_mode=form_post");
-    expect(html).toContain("response_type=id_token");
-    expect(html).toContain("scope=openid%20profile%20email");
-    expect(html).toContain(`client_id=${CLIENT_ID}`);
-    expect(html).toContain(`${ISSUER}/authorize?`);
+    const authorizeUrl = /data-authorize-url="([^"]+)"/.exec(html)?.[1] ?? "";
+    expect(authorizeUrl).toContain("http://idp.example.test/authorize?");
+    const params = new URL(authorizeUrl.replace(/&amp;/g, "&")).searchParams;
+    expect(params.get("response_type")).toBe("code");
+    expect(params.get("client_id")).toBe(CLIENT_ID);
+    expect(params.get("redirect_uri")).toBe(`${RP_BASE_URL}/callback`);
+    expect(params.get("scope")).toBe("openid profile email");
+    expect(params.get("state")).toMatch(/^[A-Za-z0-9_-]{22}$/);
+    // The implicit/OIDC parameters of the previous flow are gone.
+    expect(params.get("response_mode")).toBeNull();
+    expect(params.get("nonce")).toBeNull();
+    // Spaces in scope are %20, not "+", matching the gateway's reference URL.
+    expect(authorizeUrl).toContain("scope=openid%20profile%20email");
   });
 
   it("GET / ships the inline DPoP key logic and an inert login link", async () => {
     const html = await (await fetch(`${rp.url}/`)).text();
-
-    // Section 13: the key pair is made here, and only its thumbprint travels.
-    expect(html).toContain("crypto.subtle.generateKey({ name: \"Ed25519\" }, false,");
+    expect(html).toContain('crypto.subtle.generateKey({ name: "Ed25519" }, false,');
     expect(html).toContain('"&dpop_jkt=" + encodeURIComponent(jkt)');
-    expect(html).toContain("my DPoP jkt:");
-    // The authorize URL sits in a data attribute, so the button cannot be followed
-    // before dpop_jkt exists -- /authorize would answer 400.
-    expect(html).toContain('aria-disabled="true"');
-    expect(html).toContain("data-authorize-url=");
-    expect(html).not.toMatch(/<a class="login-btn"[^>]*\shref=/);
+    expect(html).toContain('id="login-btn" aria-disabled="true"');
+    expect(html).not.toMatch(/<a[^>]+class="login-btn"[^>]+href=/);
   });
 
-  it("GET / generates a fresh nonce and state per request", async () => {
-    const extract = (html: string, key: string) =>
-      new RegExp(`${key}=([A-Za-z0-9_-]+)`).exec(html)?.[1];
-    const first = await (await fetch(`${rp.url}/`)).text();
-    const second = await (await fetch(`${rp.url}/`)).text();
+  it("GET / generates a fresh state per request and parks it for the callback", async () => {
+    const stateOf = async (): Promise<string> => {
+      const html = await (await fetch(`${rp.url}/`)).text();
+      return /data-state="([^"]+)"/.exec(html)?.[1] ?? "";
+    };
+    const first = await stateOf();
+    const second = await stateOf();
+    expect(first).toMatch(/^[A-Za-z0-9_-]{22}$/);
+    expect(first).not.toBe(second);
 
-    expect(extract(first, "nonce")).toBeTruthy();
-    expect(extract(first, "state")).toBeTruthy();
-    expect(extract(first, "nonce")).not.toBe(extract(second, "nonce"));
-    expect(extract(first, "state")).not.toBe(extract(second, "state"));
+    const html = await (await fetch(`${rp.url}/`)).text();
+    const state = /data-state="([^"]+)"/.exec(html)?.[1] ?? "";
+    // The same value is in the authorize URL and in the attribute the script stores.
+    expect(html).toContain(`state=${state}`);
+    expect(html).toContain('sessionStorage.setItem("pasta-rp-state", state)');
   });
 
-  it("accepts a valid id_token and shows the success page with the sub", async () => {
-    const { status, html } = await postCallback(rp.url, {
-      id_token: signJwt(validPayload()),
-      state: "rp-demo-state",
+  it("GET /callback?code&state serves the token page with both values escaped in", async () => {
+    const res = await fetch(`${rp.url}/callback?code=abc123&state=xyz789`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    const html = await res.text();
+
+    expect(html).toContain('data-code="abc123"');
+    expect(html).toContain('data-state="xyz789"');
+    expect(html).toContain(`data-issuer="${ISSUER}"`);
+    expect(html).toContain(`data-client-id="${CLIENT_ID}"`);
+    expect(html).toContain(`data-redirect-uri="${RP_BASE_URL}/callback"`);
+    // The page, not the server, spends the code.
+    expect(html).toContain("PastaToken.obtainToken");
+    expect(html).toContain('id="refresh-btn"');
+  });
+
+  it("passes an assertion JWT code through to the page untouched", async () => {
+    // Section 14 (revised): the code is the group-signed authentication assertion, not an
+    // opaque handle. It is long and contains dots; the server must not shorten or parse it.
+    const assertion = [
+      Buffer.from(JSON.stringify({ alg: "EdDSA", typ: "JWT", kid: "pasta-group-key-1" })).toString(
+        "base64url"
+      ),
+      Buffer.from(
+        JSON.stringify({
+          iss: ISSUER,
+          sub: "usr_alice_12345",
+          aud: ISSUER,
+          cnf: { jkt: "b0JFnFHOoQOqFk3sGvEnW6tC8VOBT9NIXtYjIrhAHTA" },
+          nonce: "challenge_c_value",
+          iat: 1_757_000_000,
+          exp: 1_757_000_060,
+        })
+      ).toString("base64url"),
+      Buffer.alloc(64, 7).toString("base64url"),
+    ].join(".");
+    expect(assertion.length).toBeGreaterThan(300);
+
+    const res = await fetch(
+      `${rp.url}/callback?code=${encodeURIComponent(assertion)}&state=xyz789`
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+
+    expect(html).toContain(`data-code="${assertion}"`);
+    // Nothing about the assertion is interpreted: no claim of it reaches the markup.
+    expect(html).not.toContain("usr_alice_12345");
+  });
+
+  it("escapes a hostile code and state instead of letting them become markup", async () => {
+    const hostile = '"><img src=x onerror=alert(1)>';
+    const res = await fetch(
+      `${rp.url}/callback?code=${encodeURIComponent(hostile)}&state=${encodeURIComponent(hostile)}`
+    );
+    const html = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(html).not.toContain("<img src=x");
+    expect(html).toContain("&quot;&gt;&lt;img src=x onerror=alert(1)&gt;");
+  });
+
+  it("returns 400 when the redirect carries no code", async () => {
+    const res = await fetch(`${rp.url}/callback`);
+    expect(res.status).toBe(400);
+    const html = await res.text();
+    expect(html).toContain("400 Bad Request");
+    expect(html).toContain("認可コード");
+    // No token flow on a page with no code.
+    expect(html).not.toContain("PastaToken");
+  });
+
+  it("returns 400 with no code even when state is present", async () => {
+    const res = await fetch(`${rp.url}/callback?state=xyz789`);
+    expect(res.status).toBe(400);
+  });
+
+  it("shows the authorization server's error instead of running the token flow", async () => {
+    const res = await fetch(
+      `${rp.url}/callback?error=access_denied&error_description=user%20refused&state=xyz789`
+    );
+    expect(res.status).toBe(400);
+    const html = await res.text();
+
+    expect(html).toContain("認可に失敗しました");
+    expect(html).toContain("access_denied");
+    expect(html).toContain("user refused");
+    expect(html).toContain("xyz789");
+    expect(html).not.toContain("PastaToken");
+  });
+
+  it("prefers the error branch over a code, and escapes the error text", async () => {
+    const res = await fetch(
+      `${rp.url}/callback?error=${encodeURIComponent("<script>alert(1)</script>")}&code=abc`
+    );
+    expect(res.status).toBe(400);
+    const html = await res.text();
+    expect(html).not.toContain("<script>alert(1)");
+    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+  });
+
+  it("no longer accepts a form_post to /callback", async () => {
+    // The id_token form_post of the previous flow is gone (contract section 14 廃止).
+    const res = await fetch(`${rp.url}/callback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "id_token=x&state=y",
     });
-
-    expect(status).toBe(200);
-    expect(html).toContain("認証成功");
-    expect(html).toContain("usr_alice_12345");
-    expect(html).toContain("Ed25519 (EdDSA) — 有効");
-    // state is displayed, never enforced.
-    expect(html).toContain("rp-demo-state");
-    expect(html).not.toContain("認証失敗");
-  });
-
-  it("shows the token's cnf.jkt and compares it against the stored key", async () => {
-    const { status, html } = await postCallback(rp.url, {
-      id_token: signJwt(validPayload({ cnf: { jkt: "TFPUwd5DfQXkPCkjIrhAHTAb0JFnFHOoQOqFk3sGvEn" } })),
-    });
-
-    expect(status).toBe(200);
-    expect(html).toContain('data-cnf-jkt="TFPUwd5DfQXkPCkjIrhAHTAb0JFnFHOoQOqFk3sGvEn"');
-    expect(html).toContain('id="my-dpop-jkt"');
-    expect(html).toContain('id="jkt-match"');
-    // The comparison runs in the browser; the key never reaches this server.
-    expect(html).toContain("jkt === tokenJkt");
-    expect(html).toContain("crypto.subtle");
-  });
-
-  it("rejects a tampered payload", async () => {
-    const token = signJwt(validPayload());
-    const [header, , signature] = token.split(".");
-    const forged = b64u(JSON.stringify(validPayload({ sub: "usr_attacker" })));
-    const { status, html } = await postCallback(rp.url, {
-      id_token: `${header}.${forged}.${signature}`,
-    });
-
-    expect(status).toBe(401);
-    expect(html).toContain("認証失敗");
-    expect(html).toContain("signature verification failed");
-    expect(html).not.toContain("認証成功");
-  });
-
-  it("rejects a token signed by a different key", async () => {
-    const { status, html } = await postCallback(rp.url, {
-      id_token: signJwt(validPayload(), { key: otherKeyPair.privateKey }),
-    });
-
-    expect(status).toBe(401);
-    expect(html).toContain("認証失敗");
-    expect(html).toContain("signature verification failed");
-  });
-
-  it("rejects an iss mismatch", async () => {
-    const { status, html } = await postCallback(rp.url, {
-      id_token: signJwt(validPayload({ iss: "http://evil.example.test" })),
-    });
-
-    expect(status).toBe(401);
-    expect(html).toContain("認証失敗");
-    expect(html).toContain("iss mismatch");
-  });
-
-  it("rejects an aud mismatch", async () => {
-    const { status, html } = await postCallback(rp.url, {
-      id_token: signJwt(validPayload({ aud: "someone_else" })),
-    });
-
-    expect(status).toBe(401);
-    expect(html).toContain("認証失敗");
-    expect(html).toContain("aud mismatch");
-  });
-
-  it("accepts an aud array that contains the client_id", async () => {
-    const { status, html } = await postCallback(rp.url, {
-      id_token: signJwt(validPayload({ aud: ["other_client", CLIENT_ID] })),
-    });
-
-    expect(status).toBe(200);
-    expect(html).toContain("認証成功");
-  });
-
-  it("rejects an expired token", async () => {
-    const now = Math.floor(Date.now() / 1000);
-    const { status, html } = await postCallback(rp.url, {
-      id_token: signJwt(validPayload({ iat: now - 7200, exp: now - 3600 })),
-    });
-
-    expect(status).toBe(401);
-    expect(html).toContain("認証失敗");
-    expect(html).toContain("expired");
-  });
-
-  it("rejects a token issued far in the future beyond the 60s skew", async () => {
-    const now = Math.floor(Date.now() / 1000);
-    const { status, html } = await postCallback(rp.url, {
-      id_token: signJwt(validPayload({ iat: now + 600, exp: now + 4200 })),
-    });
-
-    expect(status).toBe(401);
-    expect(html).toContain("issued in the future");
-  });
-
-  it("rejects a non-EdDSA alg header", async () => {
-    const { status, html } = await postCallback(rp.url, {
-      id_token: signJwt(validPayload(), { header: { alg: "none" } }),
-    });
-
-    expect(status).toBe(401);
-    expect(html).toContain("unsupported alg");
-  });
-
-  it("rejects a malformed token", async () => {
-    const { status, html } = await postCallback(rp.url, { id_token: "not-a-jwt" });
-
-    expect(status).toBe(401);
-    expect(html).toContain("認証失敗");
-    expect(html).toContain("Malformed JWT");
-  });
-
-  it("returns 400 when id_token is missing", async () => {
-    const { status, html } = await postCallback(rp.url, { state: "rp-demo" });
-
-    expect(status).toBe(400);
-    expect(html).toContain("400");
-    expect(html).toContain("Missing id_token");
-  });
-
-  it("refetches the JWKS once for an unknown kid, then fails", async () => {
-    const before = jwks.hits;
-    const { status, html } = await postCallback(rp.url, {
-      id_token: signJwt(validPayload(), { kid: "unknown-kid" }),
-    });
-
-    expect(status).toBe(401);
-    expect(html).toContain("認証失敗");
-    expect(html).toContain("unknown-kid");
-    // Exactly one extra fetch: the cache miss triggers a single refresh.
-    expect(jwks.hits).toBe(before + 1);
-  });
-
-  it("picks up a rotated key on the refetch", async () => {
-    const rotated = crypto.generateKeyPairSync("ed25519");
-    jwks.keys = [jwkFor(publicKey, KID), jwkFor(rotated.publicKey, "rotated-kid")];
-
-    const { status, html } = await postCallback(rp.url, {
-      id_token: signJwt(validPayload(), { kid: "rotated-kid", key: rotated.privateKey }),
-    });
-
-    expect(status).toBe(200);
-    expect(html).toContain("認証成功");
-  });
-
-  it("caches the JWKS across callbacks with a known kid", async () => {
-    // Warm the cache, then confirm a second known-kid callback issues no fetch.
-    await postCallback(rp.url, { id_token: signJwt(validPayload()) });
-    const before = jwks.hits;
-    const { status } = await postCallback(rp.url, { id_token: signJwt(validPayload()) });
-
-    expect(status).toBe(200);
-    expect(jwks.hits).toBe(before);
+    expect(res.status).toBe(404);
   });
 
   it("returns 404 for unknown routes", async () => {
-    const response = await fetch(`${rp.url}/nope`);
-    expect(response.status).toBe(404);
-  });
-
-  it("escapes token content so a hostile sub cannot inject markup", async () => {
-    const { status, html } = await postCallback(rp.url, {
-      id_token: signJwt(validPayload({ sub: "<script>alert(1)</script>" })),
-    });
-
-    expect(status).toBe(200);
-    expect(html).not.toContain("<script>alert(1)</script>");
-    expect(html).toContain("&lt;script&gt;");
-  });
-});
-
-describe("rp with an unreachable JWKS endpoint", () => {
-  let rp: { server: http.Server; url: string };
-
-  beforeAll(async () => {
-    // Port 1 on loopback: nothing listens there, so the fetch fails outright.
-    rp = await startRp("http://127.0.0.1:1");
-  });
-
-  afterAll(async () => {
-    await closeServer(rp.server);
-  });
-
-  it("returns 502 when the JWKS cannot be fetched", async () => {
-    const { status, html } = await postCallback(rp.url, {
-      id_token: signJwt(validPayload()),
-    });
-
-    expect(status).toBe(502);
-    expect(html).toContain("502");
-    expect(html).toContain("JWKS");
-  });
-});
-
-describe("rp when the JWKS endpoint errors", () => {
-  let jwks: FakeJwks;
-  let rp: { server: http.Server; url: string };
-
-  beforeAll(async () => {
-    jwks = await startFakeJwks();
-    jwks.failWith = 500;
-    rp = await startRp(jwks.url);
-  });
-
-  afterAll(async () => {
-    await closeServer(rp.server);
-    await closeServer(jwks.server);
-  });
-
-  it("returns 502 on a JWKS HTTP error", async () => {
-    const { status, html } = await postCallback(rp.url, {
-      id_token: signJwt(validPayload()),
-    });
-
-    expect(status).toBe(502);
-    expect(html).toContain("502");
-  });
-
-  it("recovers once the JWKS endpoint comes back", async () => {
-    jwks.failWith = null;
-    const { status, html } = await postCallback(rp.url, {
-      id_token: signJwt(validPayload()),
-    });
-
-    expect(status).toBe(200);
-    expect(html).toContain("認証成功");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Interop with the real IdP wire format.
-//
-// The RP must accept exactly what the gateway/SDK emits. The gateway is not
-// imported here (the RP project shares no code with it), so the token and the
-// JWKS document are rebuilt byte for byte from the reference implementation's
-// rules: `deterministicJsonStringify` sorts object keys before encoding, the
-// header is {alg: "EdDSA", typ: "JWT", kid: "pasta-group-key-1"}, the payload
-// carries iss/sub/aud/iat/exp/nonce/cnf.jkt, and the JWKS entry is
-// {kty, crv, x, kid, use, alg} with x = base64url(raw 32-byte public key).
-// ---------------------------------------------------------------------------
-
-/** Byte-for-byte copy of the IdP's `deterministicJsonStringify` ordering rule. */
-function deterministicJsonStringify(obj: unknown): string {
-  if (obj === null || typeof obj !== "object") {
-    return JSON.stringify(obj);
-  }
-  if (Array.isArray(obj)) {
-    return "[" + obj.map(deterministicJsonStringify).join(",") + "]";
-  }
-  const record = obj as Record<string, unknown>;
-  const keys = Object.keys(record).sort();
-  return (
-    "{" +
-    keys.map((k) => JSON.stringify(k) + ":" + deterministicJsonStringify(record[k])).join(",") +
-    "}"
-  );
-}
-
-/** The raw 32 Ed25519 public key bytes, as the gateway holds `groupPublicKey`. */
-function rawPublicKeyBytes(key: crypto.KeyObject): Buffer {
-  const der = key.export({ type: "spki", format: "der" });
-  return Buffer.from(der.subarray(der.length - 32));
-}
-
-describe("interop with the gateway's JWT and JWKS wire format", () => {
-  const idpKeys = crypto.generateKeyPairSync("ed25519");
-  const groupPublicKey = rawPublicKeyBytes(idpKeys.publicKey);
-
-  // Exactly `OidcEndpointHandler.getJwks()`.
-  const gatewayJwks = {
-    keys: [
-      {
-        kty: "OKP",
-        crv: "Ed25519",
-        x: groupPublicKey.toString("base64url"),
-        kid: KID,
-        use: "sig",
-        alg: "EdDSA",
-      },
-    ],
-  };
-
-  // Exactly `createSigningInput(header, payload)` + `assembleJwt`.
-  function issueGatewayStyleToken(overrides: Record<string, unknown> = {}): string {
-    const now = Math.floor(Date.now() / 1000);
-    const header = { alg: "EdDSA", typ: "JWT", kid: KID };
-    const payload = {
-      iss: ISSUER,
-      sub: "usr_alice_12345",
-      aud: CLIENT_ID,
-      iat: now,
-      exp: now + 3600,
-      nonce: "random_nonce",
-      cnf: { jkt: "0d1s7hDZ0aY2pV3q4rS5tU6vW7xX8yY9zZ-AbCdEfGh" },
-      ...overrides,
-    };
-    const headerB64 = b64u(deterministicJsonStringify(header));
-    const payloadB64 = b64u(deterministicJsonStringify(payload));
-    const signingInput = `${headerB64}.${payloadB64}`;
-    const signature = crypto.sign(
-      null,
-      new TextEncoder().encode(signingInput),
-      idpKeys.privateKey
-    );
-    return `${headerB64}.${payloadB64}.${b64u(signature)}`;
-  }
-
-  let jwksServer: http.Server;
-  let rp: { server: http.Server; url: string };
-
-  beforeAll(async () => {
-    jwksServer = http.createServer((req, res) => {
-      if (req.url !== "/jwks.json") {
-        res.writeHead(404).end();
-        return;
-      }
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(gatewayJwks));
-    });
-    await new Promise<void>((resolve) =>
-      jwksServer.listen(0, "127.0.0.1", () => resolve())
-    );
-    const { port } = jwksServer.address() as AddressInfo;
-    rp = await startRp(`http://127.0.0.1:${port}`);
-  });
-
-  afterAll(async () => {
-    await closeServer(rp.server);
-    await closeServer(jwksServer);
-  });
-
-  it("sanity: the rebuilt header matches the reference byte string", () => {
-    expect(deterministicJsonStringify({ alg: "EdDSA", typ: "JWT", kid: KID })).toBe(
-      '{"alg":"EdDSA","kid":"pasta-group-key-1","typ":"JWT"}'
-    );
-  });
-
-  it("accepts a token in the gateway's exact serialisation", async () => {
-    const { status, html } = await postCallback(rp.url, {
-      id_token: issueGatewayStyleToken(),
-      state: "rp-demo",
-    });
-
-    expect(status).toBe(200);
-    expect(html).toContain("認証成功");
-    expect(html).toContain("usr_alice_12345");
-    // The cnf/jkt confirmation claim survives into the displayed claim set.
-    expect(html).toContain("jkt");
-  });
-
-  it("rejects a gateway-shaped token whose sub was swapped after signing", async () => {
-    const token = issueGatewayStyleToken();
-    const [header, payload, signature] = token.split(".");
-    const tamperedPayload = b64u(
-      deterministicJsonStringify({
-        ...JSON.parse(Buffer.from(payload, "base64url").toString("utf8")),
-        sub: "usr_attacker",
-      })
-    );
-    const { status, html } = await postCallback(rp.url, {
-      id_token: `${header}.${tamperedPayload}.${signature}`,
-    });
-
-    expect(status).toBe(401);
-    expect(html).toContain("signature verification failed");
-    expect(html).not.toContain("認証成功");
-  });
-});
-
-// ---------------------------------------------------------------------------
-
-describe("rp hardening", () => {
-  it("fetches the JWKS only once when the very first callback has an unknown kid", async () => {
-    let hits = 0;
-    const jwksServer = http.createServer((_req, res) => {
-      hits += 1;
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ keys: [jwkFor(publicKey, KID)] }));
-    });
-    await new Promise<void>((resolve) => jwksServer.listen(0, "127.0.0.1", () => resolve()));
-    const { port } = jwksServer.address() as AddressInfo;
-    const rp = await startRp(`http://127.0.0.1:${port}`);
-
-    // Cold cache: there is no stale document to refresh, so one fetch is enough.
-    const { status } = await postCallback(rp.url, {
-      id_token: signJwt(validPayload(), { kid: "never-issued" }),
-    });
-
-    expect(status).toBe(401);
-    expect(hits).toBe(1);
-
-    await closeServer(rp.server);
-    await closeServer(jwksServer);
-  });
-
-  it("answers 401, not 500, when the JWKS holds junk entries", async () => {
-    const jwksServer = http.createServer((_req, res) => {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ keys: [null, "not-a-key", [], { kty: "RSA", n: "x" }] }));
-    });
-    await new Promise<void>((resolve) => jwksServer.listen(0, "127.0.0.1", () => resolve()));
-    const { port } = jwksServer.address() as AddressInfo;
-    const rp = await startRp(`http://127.0.0.1:${port}`);
-
-    const { status, html } = await postCallback(rp.url, { id_token: signJwt(validPayload()) });
-
-    expect(status).toBe(401);
-    expect(html).toContain("認証失敗");
-
-    await closeServer(rp.server);
-    await closeServer(jwksServer);
-  });
-
-  it("answers 413 instead of dropping the connection on an oversized body", async () => {
-    const rp = await startRp("http://127.0.0.1:1");
-
-    const response = await fetch(`${rp.url}/callback`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: `id_token=${"A".repeat(2_000_000)}`,
-    });
-    const html = await response.text();
-
-    expect(response.status).toBe(413);
-    expect(html).toContain("413");
-
-    await closeServer(rp.server);
-  });
-
-  it("rejects a token whose exp is not a number", async () => {
-    await withFreshRp(async ({ rp }) => {
-      const { status, html } = await postCallback(rp.url, {
-        id_token: signJwt(validPayload({ exp: "9999999999" })),
-      });
-
-      expect(status).toBe(401);
-      expect(html).toContain("exp claim");
-    });
-  });
-
-  it("escapes a hostile state value from the form_post body", async () => {
-    await withFreshRp(async ({ rp }) => {
-      const { status, html } = await postCallback(rp.url, {
-        id_token: signJwt(validPayload()),
-        state: '"><img src=x onerror=alert(1)>',
-      });
-
-      expect(status).toBe(200);
-      expect(html).not.toContain("<img src=x");
-      expect(html).toContain("&lt;img src=x");
-    });
-  });
-
-  it("keeps the cached JWKS when a bogus kid forces a refetch that fails", async () => {
-    await withFreshRp(async ({ rp, jwks }) => {
-      // Warm the cache while the IdP is up.
-      const warm = await postCallback(rp.url, { id_token: signJwt(validPayload()) });
-      expect(warm.status).toBe(200);
-
-      // IdP goes down, then an unknown kid asks for a refetch that cannot succeed.
-      jwks.failWith = 503;
-      const unknownKid = await postCallback(rp.url, {
-        id_token: signJwt(validPayload(), { kid: "bogus-kid" }),
-      });
-      expect(unknownKid.status).toBe(502);
-
-      // The good document must survive: a known kid still verifies offline.
-      const { status, html } = await postCallback(rp.url, { id_token: signJwt(validPayload()) });
-      expect(status).toBe(200);
-      expect(html).toContain("認証成功");
-    });
-  });
-
-  it("accepts an iss that differs from the configured issuer only by a trailing slash", async () => {
-    await withFreshRp(async ({ rp }) => {
-      const { status, html } = await postCallback(rp.url, {
-        id_token: signJwt(validPayload({ iss: `${ISSUER}/` })),
-      });
-
-      expect(status).toBe(200);
-      expect(html).toContain("認証成功");
-    });
-  });
-
-  it("omits the state row when the form_post carries an empty state", async () => {
-    await withFreshRp(async ({ rp }) => {
-      const { status, html } = await postCallback(rp.url, {
-        id_token: signJwt(validPayload({ nonce: undefined })),
-        state: "",
-      });
-
-      expect(status).toBe(200);
-      expect(html).not.toContain("表示のみ");
-    });
+    expect((await fetch(`${rp.url}/nope`)).status).toBe(404);
+    expect((await fetch(`${rp.url}/jwks.json`)).status).toBe(404);
   });
 
   it("offers a way back to the portal from every result page", async () => {
-    await withFreshRp(async ({ rp, jwks }) => {
-      const success = await postCallback(rp.url, { id_token: signJwt(validPayload()) });
-      const failure = await postCallback(rp.url, { id_token: "not-a-jwt" });
-      const missing = await postCallback(rp.url, { state: "x" });
-      jwks.failWith = 503;
-      const badGateway = await postCallback(rp.url, {
-        id_token: signJwt(validPayload(), { kid: "another-unknown-kid" }),
-      });
-
-      expect(badGateway.status).toBe(502);
-      for (const { html } of [success, failure, missing, badGateway]) {
-        expect(html).toContain('href="/"');
-      }
-      // Only the callback page offers the IdP demo link.
-      expect(success.html).toContain(`href="${ISSUER}/demo"`);
-    });
+    const pages = await Promise.all(
+      [
+        `${rp.url}/callback?code=abc&state=xyz`,
+        `${rp.url}/callback`,
+        `${rp.url}/callback?error=access_denied`,
+      ].map(async (url) => (await fetch(url)).text())
+    );
+    for (const html of pages) {
+      expect(html).toContain('href="/"');
+    }
   });
 });
 
-// ---------------------------------------------------------------------------
-// Demo log (docs/container-split.md section 10): compact 1-2 line events, prefixed [rp].
-// ---------------------------------------------------------------------------
+describe("URL construction", () => {
+  const config = { rpBaseUrl: RP_BASE_URL, issuer: ISSUER, clientId: CLIENT_ID };
+
+  it("uses one redirect_uri at /authorize and at /token", () => {
+    // The value is compared byte for byte by the authorization server, so it has to come
+    // from the same place both times.
+    expect(redirectUriFor(config)).toBe(`${RP_BASE_URL}/callback`);
+    expect(buildAuthorizeUrl(config, "st")).toContain(
+      `redirect_uri=${encodeURIComponent(`${RP_BASE_URL}/callback`)}`
+    );
+  });
+
+  it("keeps openid in scope, which the gateway's /authorize still expects", () => {
+    expect(buildAuthorizeUrl(config, "st")).toContain("scope=openid%20profile%20email");
+  });
+
+  it("never produces a double slash from a trailing slash in configuration", () => {
+    const trimmed = configFromEnv({
+      ISSUER: "http://idp.example.test/",
+      RP_BASE_URL: "http://rp.example.test///",
+    });
+    expect(buildAuthorizeUrl(trimmed, "st")).toContain("http://idp.example.test/authorize?");
+    expect(redirectUriFor(trimmed)).toBe("http://rp.example.test/callback");
+  });
+});
 
 describe("demo log", () => {
+  let rp: RunningRp;
   let logSpy: ReturnType<typeof vi.spyOn>;
+  const ORIGINAL_ENV = { ...process.env };
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    process.env.DEMO_LOG = "1";
+    process.env.NO_COLOR = "1";
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    rp = await startRp();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await stop(rp);
     logSpy.mockRestore();
+    process.env = { ...ORIGINAL_ENV };
   });
 
-  it("GET / logs a landing event with its own nonce/state", async () => {
-    await withFreshRp(async ({ rp }) => {
-      logSpy.mockClear();
-      await fetch(`${rp.url}/`);
+  function rpLines(): string[] {
+    return logSpy.mock.calls.map((call) => call[0] as string).filter((l) => l.startsWith("[rp]"));
+  }
 
-      const lines = logSpy.mock.calls.map((call) => String(call[0]));
-      const landing = lines.find((l) => l.includes("landing   "));
-      expect(landing).toBeDefined();
-      expect(landing).toMatch(/^\[rp\] {6}landing {3}nonce=\S+ state=\S+ {2}→ authorize URL$/);
-      // The claim about what the rp never holds belongs to the startup line only.
-      expect(lines.some((l) => l.includes("never:"))).toBe(false);
-    });
+  it("GET / logs one landing line carrying the state it just issued", async () => {
+    const html = await (await fetch(`${rp.url}/`)).text();
+    const state = /data-state="([^"]+)"/.exec(html)?.[1] ?? "";
+
+    const lines = rpLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toBe(`[rp]      landing   state=${state}  → authorize URL`);
+    // No nonce any more: this is OAuth, not OIDC.
+    expect(lines[0]).not.toContain("nonce");
   });
 
-  it("a successful /callback logs one arrival line plus the verification line, no ✖", async () => {
-    await withFreshRp(async ({ rp }) => {
-      logSpy.mockClear();
-      const { status } = await postCallback(rp.url, {
-        id_token: signJwt(validPayload()),
-        state: "rp-demo-state",
-      });
-      expect(status).toBe(200);
+  it("GET /callback logs the code truncated to 8 chars and says the browser takes over", async () => {
+    await fetch(`${rp.url}/callback?code=code_abcdefghijklmnop&state=st-1`);
 
-      const lines = logSpy.mock.calls.map((call) => String(call[0]));
-      const callbackLines = lines.filter((l) => l.includes("callback") || l.includes("JWKS kid="));
-      expect(
-        callbackLines.some(
-          (l) =>
-            l.includes("[rp]      callback  state=rp-demo-state") &&
-            l.includes("← id_token") &&
-            l.includes("direct from browser, not via gateway")
-        )
-      ).toBe(true);
-      expect(
-        callbackLines.some((l) => l.includes("JWKS kid=") && l.includes("Ed25519 ✓"))
-      ).toBe(true);
-      expect(callbackLines.some((l) => l.includes("sub=usr_alice_12345"))).toBe(true);
-      expect(callbackLines.some((l) => l.includes("✖"))).toBe(false);
-    });
+    const lines = rpLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toBe(
+      "[rp]      callback  state=st-1  ← code(assertion) code_abc " +
+        "(query, via browser redirect)  → page with token script"
+    );
+    // The log names what the code actually is: a signed assertion, not a database key.
+    expect(lines[0]).toContain("code(assertion)");
+    // The server never saw a token, so it cannot log one.
+    expect(lines[0]).not.toContain("access_token");
   });
 
-  it("a failed /callback logs the arrival line plus one ✖ line and no verification line", async () => {
-    await withFreshRp(async ({ rp }) => {
-      const token = signJwt(validPayload());
-      const [header, , signature] = token.split(".");
-      const forged = Buffer.from(
-        JSON.stringify(validPayload({ sub: "usr_attacker" })),
-        "utf8"
-      ).toString("base64url");
+  it("a callback with no code logs one ✖ line and nothing else", async () => {
+    await fetch(`${rp.url}/callback`);
+    const lines = rpLines();
+    expect(lines).toEqual(["[rp]      ✖ callback rejected: no code in the redirect query string"]);
+  });
 
-      logSpy.mockClear();
-      const { status } = await postCallback(rp.url, { id_token: `${header}.${forged}.${signature}` });
-      expect(status).toBe(401);
-
-      const lines = logSpy.mock.calls.map((call) => String(call[0]));
-      const callbackLines = lines.filter((l) => l.includes("[rp]") || l.includes("JWKS kid="));
-      expect(callbackLines.some((l) => l.includes("callback  ") && l.includes("← id_token"))).toBe(
-        true
-      );
-      expect(callbackLines.some((l) => l.includes("Ed25519 ✓"))).toBe(false);
-      const failureLines = callbackLines.filter((l) => l.includes("✖"));
-      expect(failureLines).toHaveLength(1);
-      // The refusal sits in the tag column, like every other event's first line.
-      expect(failureLines[0].startsWith("[rp]      ✖ callback rejected:")).toBe(true);
-      expect(failureLines[0]).toContain("signature verification failed");
-    });
+  it("an error redirect logs the authorization server's error code", async () => {
+    await fetch(`${rp.url}/callback?error=access_denied&error_description=nope`);
+    const lines = rpLines();
+    expect(lines).toEqual([
+      "[rp]      ✖ callback rejected: authorization server returned error=access_denied (nope)",
+    ]);
   });
 
   it("DEMO_LOG=0 suppresses [rp] output entirely", async () => {
-    const previous = process.env.DEMO_LOG;
     process.env.DEMO_LOG = "0";
-    try {
-      await withFreshRp(async ({ rp }) => {
-        logSpy.mockClear();
-        await fetch(`${rp.url}/`);
-        await postCallback(rp.url, { id_token: signJwt(validPayload()) });
-
-        const rpLines = logSpy.mock.calls
-          .map((call) => String(call[0]))
-          .filter((l) => l.startsWith("[rp]"));
-        expect(rpLines).toHaveLength(0);
-      });
-    } finally {
-      if (previous === undefined) delete process.env.DEMO_LOG;
-      else process.env.DEMO_LOG = previous;
-    }
+    await fetch(`${rp.url}/`);
+    await fetch(`${rp.url}/callback?code=abc&state=st`);
+    await fetch(`${rp.url}/callback`);
+    expect(rpLines()).toHaveLength(0);
   });
 });
 
@@ -848,15 +344,14 @@ describe("portFromEnv", () => {
     expect(portFromEnv({})).toBe(DEFAULT_PORT);
     expect(portFromEnv({ PORT: "" })).toBe(DEFAULT_PORT);
     expect(portFromEnv({ PORT: "   " })).toBe(DEFAULT_PORT);
-    expect(portFromEnv({ PORT: "http" })).toBe(DEFAULT_PORT);
-    expect(portFromEnv({ PORT: "3001.5" })).toBe(DEFAULT_PORT);
-    expect(portFromEnv({ PORT: "70000" })).toBe(DEFAULT_PORT);
+    expect(portFromEnv({ PORT: "abc" })).toBe(DEFAULT_PORT);
+    expect(portFromEnv({ PORT: "3.5" })).toBe(DEFAULT_PORT);
     expect(portFromEnv({ PORT: "-1" })).toBe(DEFAULT_PORT);
+    expect(portFromEnv({ PORT: "70000" })).toBe(DEFAULT_PORT);
   });
 
   it("honours a valid port, including 0 for an ephemeral bind", () => {
-    expect(portFromEnv({ PORT: "3001" })).toBe(3001);
-    expect(portFromEnv({ PORT: " 8080 " })).toBe(8080);
+    expect(portFromEnv({ PORT: "8080" })).toBe(8080);
     expect(portFromEnv({ PORT: "0" })).toBe(0);
   });
 });
@@ -864,28 +359,35 @@ describe("portFromEnv", () => {
 describe("configFromEnv", () => {
   it("applies the contract's defaults", () => {
     expect(configFromEnv({})).toEqual({
-      rpBaseUrl: "http://localhost:3001",
-      issuer: "http://localhost:3000",
-      idpInternalUrl: "http://localhost:3000",
-      clientId: "demo_client",
+      rpBaseUrl: DEFAULT_RP_BASE_URL,
+      issuer: DEFAULT_ISSUER,
+      clientId: DEFAULT_CLIENT_ID,
     });
   });
 
-  it("falls back to ISSUER when IDP_INTERNAL_URL is unset, and trims slashes", () => {
-    expect(configFromEnv({ ISSUER: "http://idp.test/", RP_BASE_URL: "http://rp.test//" })).toEqual({
-      rpBaseUrl: "http://rp.test",
-      issuer: "http://idp.test",
-      idpInternalUrl: "http://idp.test",
-      clientId: "demo_client",
+  it("trims trailing slashes from both base URLs", () => {
+    expect(
+      configFromEnv({ ISSUER: "http://gw:3000//", RP_BASE_URL: "http://rp:3001/" })
+    ).toEqual({
+      rpBaseUrl: "http://rp:3001",
+      issuer: "http://gw:3000",
+      clientId: DEFAULT_CLIENT_ID,
     });
   });
 
-  it("uses IDP_INTERNAL_URL for JWKS while iss stays the browser-visible issuer", () => {
+  it("has no JWKS host setting: the browser fetches /jwks.json from ISSUER", () => {
+    // IDP_INTERNAL_URL was removed with the server-side verifier. An environment that
+    // still sets it must be ignored rather than silently pointing the browser at a
+    // compose-internal hostname it cannot resolve.
     const config = configFromEnv({
       ISSUER: "http://localhost:3000",
       IDP_INTERNAL_URL: "http://gateway:3000",
+    } as Record<string, string>);
+    expect(config).toEqual({
+      rpBaseUrl: DEFAULT_RP_BASE_URL,
+      issuer: "http://localhost:3000",
+      clientId: DEFAULT_CLIENT_ID,
     });
-    expect(config.issuer).toBe("http://localhost:3000");
-    expect(config.idpInternalUrl).toBe("http://gateway:3000");
+    expect(Object.keys(config)).not.toContain("idpInternalUrl");
   });
 });

@@ -1,18 +1,21 @@
 /**
  * Runtime configuration for the RP (ZK-App Portal).
  *
- * The RP is a pure OIDC Relying Party: it never reads dealer secrets and never
- * shares code with the IdP. Everything it needs to verify a token comes from
- * the IdP's public JWKS endpoint.
+ * The RP is an OAuth 2.0 client (docs/container-split.md section 14). Its server side
+ * holds nothing: it builds an `/authorize` URL and serves the callback HTML. The token
+ * request, the JWKS fetch and the signature check all happen in the browser, because the
+ * DPoP private key lives only in this origin's IndexedDB (section 13).
+ *
+ * There is deliberately no JWKS host setting any more. The browser is the only party that
+ * fetches `/jwks.json`, so the URL has to be the one the browser can reach — `ISSUER`.
+ * `IDP_INTERNAL_URL`, which the previous server-side verifier used, has been removed.
  */
 export interface RpConfig {
   /** Public base URL of this RP, used to build `redirect_uri`. */
   rpBaseUrl: string;
-  /** Expected `iss` of the id_token, and the base of the `/authorize` URL. */
+  /** Authorization server base URL: `/authorize`, `/token`, `/jwks.json` and the `iss` the browser checks. */
   issuer: string;
-  /** Base URL used server-side to fetch JWKS (compose-internal host). */
-  idpInternalUrl: string;
-  /** Expected `aud` of the id_token. */
+  /** OAuth `client_id`, and the `aud` the browser checks. */
   clientId: string;
 }
 
@@ -20,7 +23,6 @@ export interface RpEnv {
   PORT?: string;
   RP_BASE_URL?: string;
   ISSUER?: string;
-  IDP_INTERNAL_URL?: string;
   CLIENT_ID?: string;
 }
 
@@ -35,11 +37,9 @@ function trimTrailingSlash(value: string): string {
 }
 
 export function configFromEnv(env: RpEnv = process.env as RpEnv): RpConfig {
-  const issuer = trimTrailingSlash(env.ISSUER || DEFAULT_ISSUER);
   return {
     rpBaseUrl: trimTrailingSlash(env.RP_BASE_URL || DEFAULT_RP_BASE_URL),
-    issuer,
-    idpInternalUrl: trimTrailingSlash(env.IDP_INTERNAL_URL || issuer),
+    issuer: trimTrailingSlash(env.ISSUER || DEFAULT_ISSUER),
     clientId: env.CLIENT_ID || DEFAULT_CLIENT_ID,
   };
 }

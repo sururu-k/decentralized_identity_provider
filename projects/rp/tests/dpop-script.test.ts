@@ -1,6 +1,11 @@
 import crypto from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { DPOP_SCRIPT, renderCallbackPage, renderLandingPage } from "../src/html.js";
+import {
+  DPOP_SCRIPT,
+  TOKEN_SCRIPT,
+  renderCallbackPage,
+  renderLandingPage,
+} from "../src/html.js";
 
 /**
  * The rp pages carry their DPoP logic as inline JavaScript with no build step, so nothing
@@ -14,9 +19,12 @@ import { DPOP_SCRIPT, renderCallbackPage, renderLandingPage } from "../src/html.
  * 2. Every `<script>` block of both pages is parsed with `new Function`, which catches a
  *    syntax error introduced while editing the string without executing anything.
  *
+ * The token half of the inline JavaScript — proof, `/token`, JWKS, verification — is
+ * exercised for real in `tests/token-script.test.ts`.
+ *
  * What these cannot cover: IndexedDB has no Node implementation, so `openDb`, `idbGet`,
- * `idbPut` and `ensureKeyPair`'s reuse path are reviewed by reading, not by running.
- * `projects/rp/README.md` records that gap.
+ * `idbPut` and the reuse path of `ensureKeyPair` / `ensureKeyMaterial` are reviewed by
+ * reading, not by running. `projects/rp/README.md` records that gap.
  */
 
 /** Evaluates the shared helper and hands back its `PastaDpop` namespace. */
@@ -96,21 +104,41 @@ describe("the inline DPoP helper", () => {
     // to disable the login button with a reason instead of failing silently.
     expect(loadPastaDpop().unavailableReason()).toContain("IndexedDB");
   });
+
+  it("exposes the key material the token flow needs, and nothing that leaks the key", () => {
+    const api = new Function(`${DPOP_SCRIPT}\nreturn PastaDpop;`)() as Record<string, unknown>;
+    expect(Object.keys(api).sort()).toEqual([
+      "ensureJkt",
+      "ensureKeyMaterial",
+      "ensureKeyPair",
+      "jktFromJwk",
+      "unavailableReason",
+    ]);
+    // The private key is generated non-extractable, so no export path can exist.
+    expect(DPOP_SCRIPT).toContain('crypto.subtle.generateKey({ name: "Ed25519" }, false,');
+    expect(DPOP_SCRIPT).not.toContain('exportKey("pkcs8"');
+  });
 });
 
 describe("the inline page scripts", () => {
-  const landing = renderLandingPage({ authorizeUrl: "http://idp.test/authorize?nonce=n1" });
+  const landing = renderLandingPage({
+    authorizeUrl: "http://idp.test/authorize?response_type=code&state=st1",
+    state: "st1",
+  });
   const callback = renderCallbackPage({
-    valid: true,
-    payload: { sub: "usr_alice_12345", cnf: { jkt: "b0JFnFHOoQOqFk3sGvEnW6tC8VOBT9NIXtYjIrhAHTA" } },
+    code: "code_abc",
+    state: "st1",
     issuer: "http://idp.test",
+    clientId: "demo_client",
+    redirectUri: "http://localhost:3001/callback",
   });
 
   it("parse as JavaScript on both pages", () => {
-    const blocks = [...scriptBlocks(landing), ...scriptBlocks(callback)];
-    expect(blocks).toHaveLength(4); // the shared helper plus one page script each
+    // Landing: helper + glue. Callback: helper + token client + glue.
+    expect(scriptBlocks(landing)).toHaveLength(2);
+    expect(scriptBlocks(callback)).toHaveLength(3);
 
-    for (const body of blocks) {
+    for (const body of [...scriptBlocks(landing), ...scriptBlocks(callback)]) {
       expect(body.trim().length).toBeGreaterThan(0);
       expect(() => new Function(body)).not.toThrow();
     }
@@ -120,6 +148,7 @@ describe("the inline page scripts", () => {
     // A stray </script> in a string literal would end the block early and dump the rest
     // of the helper into the document as text.
     expect(DPOP_SCRIPT).not.toContain("</script");
+    expect(TOKEN_SCRIPT).not.toContain("</script");
   });
 
   it("build the authorize URL with dpop_jkt on the landing page", () => {
@@ -127,40 +156,31 @@ describe("the inline page scripts", () => {
     expect(landing).toContain('"&dpop_jkt=" + encodeURIComponent(jkt)');
     // The link is inert until the thumbprint is known.
     expect(landing).toContain('id="login-btn" aria-disabled="true"');
-    expect(landing).toContain('data-authorize-url="http://idp.test/authorize?nonce=n1"');
+    expect(landing).toContain(
+      'data-authorize-url="http://idp.test/authorize?response_type=code&amp;state=st1"'
+    );
     expect(landing).not.toContain('href="http://idp.test/authorize');
     expect(landing).toContain("my DPoP jkt:");
+    // state is parked for the callback to compare against.
+    expect(landing).toContain('sessionStorage.setItem("pasta-rp-state", state)');
   });
 
-  it("compare the stored key against cnf.jkt on the callback page", () => {
-    expect(callback).toContain("crypto.subtle");
-    expect(callback).toContain(
-      'data-cnf-jkt="b0JFnFHOoQOqFk3sGvEnW6tC8VOBT9NIXtYjIrhAHTA"'
-    );
-    expect(callback).toContain('id="my-dpop-jkt"');
-    expect(callback).toContain('id="jkt-match"');
-    expect(callback).toContain("jkt === tokenJkt");
+  it("wire the callback page to the token flow rather than to a server check", () => {
+    expect(callback).toContain("PastaToken.obtainToken");
+    expect(callback).toContain('sessionStorage.getItem("pasta-rp-state")');
+    expect(callback).toContain('id="refresh-btn"');
+    expect(callback).toContain('grant_type: "refresh_token"');
+    expect(callback).toContain('grant_type: "authorization_code"');
   });
 
-  it("render an empty cnf.jkt attribute when the token carries no binding", () => {
-    const html = renderCallbackPage({
-      valid: true,
-      payload: { sub: "usr_alice_12345" },
-      issuer: "http://idp.test",
-    });
-
-    expect(html).toContain('data-cnf-jkt=""');
-    expect(html).toContain("(なし)");
-  });
-
-  it("escape a hostile cnf.jkt instead of breaking out of the attribute", () => {
-    const html = renderCallbackPage({
-      valid: true,
-      payload: { sub: "usr_alice_12345", cnf: { jkt: '"><img src=x onerror=alert(1)>' } },
-      issuer: "http://idp.test",
-    });
-
-    expect(html).not.toContain("<img src=x");
-    expect(html).toContain("&quot;&gt;&lt;img");
+  it("render every externally supplied value with textContent, never innerHTML", () => {
+    // A token, a claim set or an error body must not be able to become markup.
+    for (const body of scriptBlocks(callback)) {
+      expect(body).not.toContain("innerHTML");
+      expect(body).not.toContain("outerHTML");
+      expect(body).not.toContain("insertAdjacentHTML");
+      expect(body).not.toContain("document.write");
+    }
+    expect(callback).toContain("accessTokenEl.textContent = tokens.access_token");
   });
 });
