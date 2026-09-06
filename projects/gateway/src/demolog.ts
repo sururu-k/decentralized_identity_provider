@@ -111,6 +111,8 @@ export interface AuthorizeInfo {
   redirectUri: string;
   nonce: string;
   state: string | undefined;
+  /** The RP front end's DPoP thumbprint, carried through to the demo UI (section 13). */
+  dpopJkt: string;
   password?: never;
 }
 
@@ -226,10 +228,12 @@ export function createDemoLog(options: DemoLogOptions = {}): DemoLog {
     },
 
     authorize(info) {
-      // nonce/state are public correlation ids (section 10), never truncated.
+      // nonce/state are public correlation ids (section 10), never truncated. dpop_jkt is
+      // a cryptographic value, so it is cut to 8 characters like every other one.
       head(
         "authorize",
-        `client_id=${info.clientId} nonce=${info.nonce} state=${info.state ?? "-"}  → redirect /demo`
+        `client_id=${info.clientId} nonce=${info.nonce} state=${info.state ?? "-"} ` +
+          `dpop_jkt=${shortValue(info.dpopJkt)}  → redirect /demo`
       );
     },
 

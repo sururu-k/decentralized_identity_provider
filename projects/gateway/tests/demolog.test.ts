@@ -39,6 +39,9 @@ const SIGN_ON = {
   excluded: [],
 };
 
+/** A real RFC 7638 thumbprint: SHA-256, base64url, 43 characters (section 13). */
+const RP_JKT = "b0JFnFHOoQOqFk3sGvEnW6tC8VOBT9NIXtYjIrhAHTA";
+
 describe("DEMO_LOG", () => {
   it("is on unless the value is exactly 0", () => {
     expect(demoLogEnabled({})).toBe(true);
@@ -64,6 +67,7 @@ describe("DEMO_LOG", () => {
       redirectUri: "http://rp/cb",
       nonce: "n",
       state: "s",
+      dpopJkt: RP_JKT,
     });
     log.signOn(SIGN_ON);
     log.refresh({
@@ -207,13 +211,15 @@ describe("event wording", () => {
       redirectUri: "http://localhost:3001/callback",
       nonce: "n-abcdefghijkl",
       state: "st-1",
+      dpopJkt: RP_JKT,
     });
     log.jwks();
     log.discovery();
     log.demoRpCallback({ idToken: "eyJhbGciOiJFZERTQSJ9.e30.AAAA", verified: false });
 
     expect(lines).toEqual([
-      "[gateway] authorize client_id=demo_client nonce=n-abcdefghijkl state=st-1  → redirect /demo",
+      "[gateway] authorize client_id=demo_client nonce=n-abcdefghijkl state=st-1 " +
+        `dpop_jkt=${RP_JKT.slice(0, 8)}  → redirect /demo`,
       "[gateway] jwks      public only",
       "[gateway] discovery public only",
       "[gateway] rp-demo   ← id_token eyJhbGci  → Ed25519 ✗  (demo-only callback page)",
@@ -227,8 +233,22 @@ describe("event wording", () => {
       redirectUri: "http://rp/cb",
       nonce: "n",
       state: undefined,
+      dpopJkt: RP_JKT,
     });
     expect(lines[0]).toContain("state=-");
+  });
+
+  it("cuts dpop_jkt to eight characters like every other cryptographic value", () => {
+    const { log, lines } = capture();
+    log.authorize({
+      clientId: "c",
+      redirectUri: "http://rp/cb",
+      nonce: "n",
+      state: "s",
+      dpopJkt: RP_JKT,
+    });
+    expect(lines[0]).toContain(`dpop_jkt=${RP_JKT.slice(0, 8)}`);
+    expect(lines[0]).not.toContain(RP_JKT);
   });
 
   it("prints a refusal as one ✖ line", () => {
@@ -267,7 +287,13 @@ describe("event wording", () => {
       keyId: "kid",
       nodeUrls: ["http://node1:4001"],
     });
-    log.authorize({ clientId: "c", redirectUri: "http://rp/cb", nonce: "n", state: "s" });
+    log.authorize({
+      clientId: "c",
+      redirectUri: "http://rp/cb",
+      nonce: "n",
+      state: "s",
+      dpopJkt: RP_JKT,
+    });
     log.signOn(SIGN_ON);
     log.jwks();
     log.discovery();

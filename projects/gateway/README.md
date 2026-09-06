@@ -146,7 +146,7 @@ RP が `kid` で鍵を引けなくなります。値が食い違う場合は起�
 |---|---|---|
 | GET | `/.well-known/openid-configuration` | OIDC Discovery |
 | GET | `/jwks.json` | グループ公開鍵 1 本の JWK Set (RFC 8037, `kty=OKP` / `crv=Ed25519`) |
-| GET | `/authorize` | 検証して `/demo?step=login&redirect_uri=...` へ meta refresh |
+| GET | `/authorize` | 検証して `/demo?step=login&redirect_uri=...&dpop_jkt=...` へ meta refresh。`dpop_jkt` 必須 |
 | POST | `/api/pasta/sign-on` | `ProxySignOnRequestBody` → `ProxySignOnResult` (b64u 化)。`nonce` 必須 |
 | POST | `/api/pasta/refresh` | `ProxyRefreshRequestBody` → `ProxyRefreshResult` (b64u 化)。`nonce` 必須 |
 | POST | `/demo/rp-callback` | デモ UI の既定 form_post 先。簡易 RP 表示 |
@@ -171,6 +171,30 @@ RP が `kid` で鍵を引けなくなります。値が食い違う場合は起�
 が出来上がります。RP がトークンを検証した後になって初めて壊れていることが分かる、という
 最悪の壊れ方です。`jwt.ts` はコピー凍結 (契約 第 1 節) で直せないため、gateway の入口で
 防ぎます。
+
+### `dpop_jkt` (契約 第 13 節)
+
+`/authorize` は `dpop_jkt` を **必須** とします。値は RP フロントが持つ DPoP 公開鍵の
+RFC 7638 サムプリント (SHA-256 の base64url) なので、`^[A-Za-z0-9_-]{43}$` に一致しなければ
+なりません。欠落・長さ違い・パディング付き・標準 base64 の英数字は、他のパラメータ不正と
+同じ経路で `400 Authorize Error: ...` になります。検証を通った値は `/demo` への引き継ぎ URL に
+`&dpop_jkt=<jkt>` として乗り、デモ UI がそれをそのまま `cnfJkt` に使います。
+
+この結果、**gateway もデモ UI もノードも DPoP 秘密鍵を持ちません**。持っているのは rp
+オリジンのページだけで、gateway が知るのはサムプリントだけです。
+
+`src/gateway/oidc.ts` は第 13 節から byte 凍結の対象外になりました (OIDC のグルーコードで
+あって暗号ではないため)。参照実装 (`ba20f512` の `src/gateway/oidc.ts`) からの差分は次の
+2 箇所だけです。
+
+- `validateAuthorizeRequest`: `AuthorizeQueryParams` に `dpop_jkt`、戻り値の `params` に
+  `dpopJkt` を追加し、`nonce` の検査の後に必須チェックと 43 文字 base64url の書式検査を足した。
+- `renderAuthorizePage`: 引数に `dpopJkt` を追加し、`/demo` の URL の末尾に
+  `&dpop_jkt=${encodeURIComponent(params.dpopJkt)}` を足した。DPoP 鍵生成に触れていた
+  コメントの手順も現状に合わせた。
+
+Discovery, JWKS, `response_type` / `response_mode` / `scope` / `nonce` の検査、HTML の
+組み立て方は参照実装のままです。
 
 ### ステータスコード
 
@@ -225,7 +249,7 @@ IdP のオリジンでスクリプトが動くことになります。
 
 ```
 [gateway] ● up      t=2/3 nodes=3 issuer=http://localhost:3000   holds: group pubkey, kid=pasta-group-key-1   never: s_i, k_i, h_i, pw, id_token
-[gateway] authorize client_id=demo_client nonce=compact-6 state=compact-6-state  → redirect /demo
+[gateway] authorize client_id=demo_client nonce=compact-6 state=compact-6-state dpop_jkt=Rupx_EC1  → redirect /demo
 [gateway] sign-on   sess=8fa90b5e round=ef54f65f user=alice nonce=compact-1  ← A mNDkmKAj  jkt y7VfmjvC  (no pw)
                     round1 (D,E)×3 → round2 ← B_i×3 ct_i×3 (no h_i, cannot decrypt) → relayed as-is
 [gateway] refresh   sess=8fa90b5e round=8837fc27  ← DPoP eyJhbGci (verified by nodes)  → ct_i×3 relayed
@@ -238,7 +262,7 @@ IdP のオリジンでスクリプトが動くことになります。
 | イベント | 行 |
 |---|---|
 | 起動 | `● up t= nodes= issuer=` + `holds:` / `never:` (1 行) |
-| `GET /authorize` | `authorize client_id= nonce= state= → redirect /demo` (1 行) |
+| `GET /authorize` | `authorize client_id= nonce= state= dpop_jkt= → redirect /demo` (1 行)。`dpop_jkt` は暗号学的な値なので先頭 8 文字 |
 | `POST /api/pasta/sign-on` | `sign-on sess= round= user= nonce= ← …` + 中継の内訳 (2 行) |
 | `POST /api/pasta/refresh` | `refresh sess= round= ← DPoP … → ct_i×N relayed` (1 行) |
 | `POST /demo/rp-callback` | `rp-demo ← id_token … → Ed25519 ✓` (1 行) |

@@ -66,8 +66,8 @@ rp:
 
 | Method | Path | 説明 |
 |---|---|---|
-| GET | `/` | ランディングページ。「PASTA IdP でログイン」ボタンが `${ISSUER}/authorize` へ遷移する |
-| POST | `/callback` | `application/x-www-form-urlencoded` で `id_token` を受け取り、検証して結果を HTML で表示 |
+| GET | `/` | ランディングページ。ページ内で DPoP 鍵を用意し、「PASTA IdP でログイン」ボタンが `${ISSUER}/authorize?...&dpop_jkt=<jkt>` へ遷移する |
+| POST | `/callback` | `application/x-www-form-urlencoded` で `id_token` を受け取り、検証して結果を HTML で表示。トークンの `cnf.jkt` と手元の鍵の jkt の一致もブラウザ側で示す |
 | GET | `/health` | `{ "status": "ok" }` |
 
 ### `GET /`
@@ -83,11 +83,32 @@ ${ISSUER}/authorize
   &scope=openid profile email
   &nonce=<リクエスト毎にランダム>
   &state=<リクエスト毎にランダム>
+  &dpop_jkt=<ページ内で計算したサムプリント>   (インライン JS が付ける)
 ```
 
 `nonce` と `state` はリクエストごとに `crypto.randomBytes(16)` から生成します。
 既存の gateway 実装にサーバ側の照合が無いため、このデモでも照合は行わず**表示のみ**です
 (本番の RP ではセッションに保存して突き合わせる必要があります)。
+
+#### DPoP 鍵はこのページが持つ (契約 第 13 節)
+
+ランディング HTML には**依存ゼロ・ビルド無しのインライン JS** が入っています。やることは
+3 つだけです。
+
+1. `crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign", "verify"])` で鍵ペアを作る。
+   `extractable=false` なので秘密鍵のバイト列は JS からも取り出せません。
+2. 秘密鍵の `CryptoKey` を IndexedDB (`pasta-rp` データベースの `dpop` ストア、キー `current`)
+   に保存する。既にあれば作り直さず再利用し、jkt を計算し直します。
+3. 公開 JWK の `{crv, kty, x}` を**辞書順**で JSON 化して SHA-256 → base64url = RFC 7638 の
+   jkt。これを画面 (`my DPoP jkt`) に出し、ログインリンクの `href` に `&dpop_jkt=<jkt>` を
+   付けてボタンを有効にします。
+
+jkt が確定するまでボタンは `aria-disabled="true"` のままで `href` を持ちません
+(`/authorize` は `dpop_jkt` 無しでは 400 を返すため)。WebCrypto が Ed25519 に対応していない、
+または IndexedDB が使えない環境では、ボタンを無効のままにして理由を画面に出します。
+
+**秘密鍵は rp サーバにも gateway にもノードにも渡りません。** サーバに出て行くのは jkt
+だけで、`id_token` の `cnf.jkt` は最初から rp オリジンの鍵に束縛されます。
 
 ### `POST /callback`
 
@@ -108,6 +129,11 @@ ${ISSUER}/authorize
 4. **`exp`** — 現在時刻より後。`iat` / `nbf` は 60 秒のクロックスキューを許容。
 
 `nonce` (トークン内) と `state` (form_post のパラメータ) は表示のみで、検証には使いません。
+
+表示には「トークンの `cnf.jkt`」「my DPoP jkt (この端末)」「DPoP 鍵の照合」の 3 行が並びます。
+サーバがやるのは 1 行目 (トークンから読んだ値をエスケープして `data-cnf-jkt` に置く) だけで、
+残り 2 行はインライン JS が IndexedDB の鍵から jkt を計算し直して埋めます。一致すれば ✓、
+違えば ✖。鍵はサーバに送られません。
 
 ## JWKS の取得とキャッシュ
 
@@ -190,11 +216,28 @@ vitest 内で `node:crypto` の `generateKeyPairSync("ed25519")` で鍵を作り
 - `iss` が末尾スラッシュだけ違うトークンを受理すること
 - 成功 / 失敗 / 400 / 502 のどのページからも `/` に戻れること
 - `/` に `redirect_uri=...%2Fcallback` と `response_mode=form_post` が含まれ、`nonce` / `state` が毎回変わること
-- 敵対的な `sub` / `state` が HTML にエスケープされること
+- 敵対的な `sub` / `state` / `cnf.jkt` が HTML にエスケープされること
+- `/` に鍵生成とサムプリント計算のインライン JS があり、ログインリンクが `href` を持たないこと
+- `/callback` にトークンの `cnf.jkt` と照合用の要素・JS があること
 - ボディが 1 MB を超えたとき、接続を切らずに 413 を返すこと
 - `exp` が数値でないトークンを拒否すること
 - `keys` に不正な要素が混ざっていても 401 で済むこと
 - `portFromEnv` / `configFromEnv` の既定値とフォールバック
+
+`tests/dpop-script.test.ts` はインライン JS のテストです。ブラウザを起動できないので、
+次の 2 つで代替します。
+
+- `DPOP_SCRIPT` を `new Function` で評価し、**Node の WebCrypto** (`crypto.subtle`、
+  Node 20 以上で Ed25519 対応) で作った鍵の jkt を計算させ、`node:crypto` で独立に計算した
+  `{crv,kty,x}` 辞書順 JSON の SHA-256 base64url と一致することを確認します。これが
+  `projects/node/src/client-sdk/dpop.ts` の `calculateJwkThumbprint` とのバイト一致に相当します
+  (node プロジェクトは import しません)。既知の公開鍵に対する固定値も突き合わせます。
+- 両ページの `<script>` の中身をすべて取り出して `new Function` でパースし、構文エラーが
+  無いことを確認します。
+
+**ブラウザでしか確かめられない部分**: IndexedDB は Node に無いので、`openDb` / `idbGet` /
+`idbPut` / `ensureKeyPair` の再利用経路はコードレビューによる確認です。実ブラウザでの
+鍵の永続化とボタンの有効化も同様です。
 
 `tests/demolog.test.ts` は `src/demolog.ts` 単体のテストです
 (`DEMO_LOG=0` での無効化、8 文字切り詰め、色の優先順位、桁揃え、`holds:` / `never:` が
@@ -220,7 +263,7 @@ src/
 ├── config.ts    # 環境変数 → RpConfig
 ├── jwks.ts      # JWKS の取得・キャッシュ・kid 選択
 ├── jwt.ts       # base64url 分解と Ed25519 検証、クレーム検証
-├── html.ts      # ページテンプレート
+├── html.ts      # ページテンプレート + インライン DPoP JS (DPOP_SCRIPT ほか)
 └── demolog.ts   # デモログ (第 10 節の圧縮形式で stdout に出力)
 ```
 

@@ -1,6 +1,12 @@
 import crypto from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { DecentralizedClientSdk } from "../src/sdk/client.js";
+import {
+  calculateJwkThumbprint,
+  createDPoPProof,
+  exportDPoPJwk,
+  generateDPoPKeyPair,
+} from "../src/sdk/dpop.js";
 import { CONTINUATION_INDENT, type DemoEvent } from "../src/sdk/events.js";
 import { base64UrlDecode } from "../src/sdk/jwt.js";
 
@@ -18,7 +24,16 @@ import { base64UrlDecode } from "../src/sdk/jwt.js";
  * Signature verification deliberately uses `node:crypto` with the JWKS key rather than
  * the SDK's own `verifyJwt`: the point is that a token this SDK assembled verifies as a
  * plain Ed25519 JWT for a relying party that shares no code with it.
+ *
+ * Since section 13 the SDK holds no DPoP key, so these tests play the rp front end: they
+ * make the key pair, pass the SDK the thumbprint, and sign the refresh proof themselves.
  */
+
+/** A DPoP key pair standing in for the one the rp landing page keeps in IndexedDB. */
+function rpFrontEndKey(): { keyPair: ReturnType<typeof generateDPoPKeyPair>; jkt: string } {
+  const keyPair = generateDPoPKeyPair();
+  return { keyPair, jkt: calculateJwkThumbprint(exportDPoPJwk(keyPair.publicKey)) };
+}
 
 const GATEWAY = process.env.DEMO_E2E_GATEWAY;
 const describeIfGateway = GATEWAY ? describe : describe.skip;
@@ -62,11 +77,11 @@ describeIfGateway("demo SDK against a live gateway", () => {
 
   it("signs alice on, and the token verifies against /jwks.json", async () => {
     const events: DemoEvent[] = [];
-    const sdk = new DecentralizedClientSdk({
-      proxyUrl: gateway,
-      issuer: gateway,
-      onEvent: (e) => events.push(e),
-    });
+    const { jkt } = rpFrontEndKey();
+    const sdk = new DecentralizedClientSdk(
+      { proxyUrl: gateway, issuer: gateway, onEvent: (e) => events.push(e) },
+      jkt
+    );
 
     const { id_token, sessionId } = await sdk.signOn({
       username: "alice",
@@ -84,6 +99,7 @@ describeIfGateway("demo SDK against a live gateway", () => {
     expect(payload.aud).toBe("demo_client");
     expect(payload.nonce).toBe("demo_e2e_nonce_1");
     expect(payload.cnf.jkt).toBe(sdk.cnfJkt);
+    expect(sdk.cnfJkt).toBe(jkt);
 
     // Section 10: one sign-on event of three lines -- blind, response, aggregate.
     expect(events.map((e) => e.step)).toEqual([
@@ -94,6 +110,8 @@ describeIfGateway("demo SDK against a live gateway", () => {
     const lines = events.flatMap((e) => e.lines);
     expect(lines).toHaveLength(3);
     expect(lines[0]).toMatch(/^\[browser\] sign-on   user=alice nonce=demo_e2e_nonce_1 {2}→ r /);
+    // Section 13: the thumbprint is labelled as the rp's, not this page's.
+    expect(lines[0]).toContain(`jkt(rp) ${jkt.slice(0, 8)}`);
     expect(lines[1]).toBe(`${CONTINUATION_INDENT}${lines[1].slice(CONTINUATION_INDENT.length)}`);
     expect(lines[1]).toContain("← B_i×3 ct_i×3 (D,E)×3  sess=");
     expect(lines[2]).toContain("→ h=finalize(pw, unblind(r,B_i))");
@@ -106,11 +124,11 @@ describeIfGateway("demo SDK against a live gateway", () => {
 
   it("refreshes with a DPoP proof and the new token still verifies", async () => {
     const events: DemoEvent[] = [];
-    const sdk = new DecentralizedClientSdk({
-      proxyUrl: gateway,
-      issuer: gateway,
-      onEvent: (e) => events.push(e),
-    });
+    const { keyPair, jkt } = rpFrontEndKey();
+    const sdk = new DecentralizedClientSdk(
+      { proxyUrl: gateway, issuer: gateway, onEvent: (e) => events.push(e) },
+      jkt
+    );
 
     const first = await sdk.signOn({
       username: "alice",
@@ -119,10 +137,12 @@ describeIfGateway("demo SDK against a live gateway", () => {
       nonce: "demo_e2e_nonce_2",
     });
 
+    const refreshEndpointUrl = `${gateway}/api/pasta/refresh`;
     const refreshed = await sdk.refresh({
       clientId: "demo_client",
       nonce: "demo_e2e_nonce_2",
-      refreshEndpointUrl: `${gateway}/api/pasta/refresh`,
+      refreshEndpointUrl,
+      dpopProof: createDPoPProof(keyPair, "POST", refreshEndpointUrl),
     });
 
     expect(refreshed.sessionId).toBe(first.sessionId);
@@ -142,11 +162,11 @@ describeIfGateway("demo SDK against a live gateway", () => {
 
   it("fails locally on a wrong password, with the nodes none the wiser", async () => {
     const events: DemoEvent[] = [];
-    const sdk = new DecentralizedClientSdk({
-      proxyUrl: gateway,
-      issuer: gateway,
-      onEvent: (e) => events.push(e),
-    });
+    const { jkt } = rpFrontEndKey();
+    const sdk = new DecentralizedClientSdk(
+      { proxyUrl: gateway, issuer: gateway, onEvent: (e) => events.push(e) },
+      jkt
+    );
 
     await expect(
       sdk.signOn({

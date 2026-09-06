@@ -306,8 +306,14 @@ scripts/demo-tmux.sh     # tmux セッション pasta-demo を作って attach
 から **alice / password123** でログインします (rp → gateway `/authorize` → デモ UI →
 form_post → rp `/callback` の一本道)。
 
+rp のページを開いた時点で、そのページが DPoP 鍵ペアを作ります。秘密鍵は rp オリジンの
+IndexedDB に `extractable=false` で残り、IdP に渡るのは公開鍵のサムプリント `dpop_jkt`
+だけです (画面の「my DPoP jkt」)。デモ UI も gateway もノードもこの秘密鍵を持たないので、
+`id_token` の `cnf.jkt` は最初から rp の鍵に束縛されます。`/callback` の画面は、保管して
+ある鍵から計算し直した jkt とトークンの `cnf.jkt` の一致を ✓ で示します。
+
 tmux の 6 つ目のペインで CLI を走らせても、**ブラウザと同じ SDK** が同じ順序で同じ計算を
-します。
+します (CLI は rp フロント役も兼ねるので、自分で DPoP 鍵を作って jkt を SDK に渡します)。
 
 ```bash
 cd projects/demo && npm run -s sign-on -- \
@@ -445,7 +451,7 @@ cd projects/rp      && npm ci && npm test
 | 順 | URL | 役割 |
 |:--:|:--|:--|
 | 1 | [http://localhost:3001/](http://localhost:3001/) | 第三者サービス (ZK-App Portal) のトップ。「PASTA IdP でログイン」ボタン |
-| 2 | [http://localhost:3000/authorize?...](http://localhost:3000/authorize?client_id=demo_client&redirect_uri=http://localhost:3001/callback&response_type=id_token&response_mode=form_post&scope=openid&nonce=n) | OAuth 認可エンドポイント。即座に `/demo` へリダイレクト |
+| 2 | `http://localhost:3000/authorize?...&dpop_jkt=<ステップ1が生成した値>` | OAuth 認可エンドポイント。即座に `/demo` へリダイレクト。`dpop_jkt` はステップ1のページが計算するのでこのリンクを直接開かず、ステップ1の「PASTA IdP でログイン」ボタン経由で遷移すること (`dpop_jkt` 無しでは 400) |
 | 3 | [http://localhost:3000/demo](http://localhost:3000/demo) | PASTA 分散 IdP ログイン・同意・FROST 署名アニメーション |
 | 4 | [http://localhost:3001/callback](http://localhost:3001/callback) | RP コールバック。`id_token` を受信・Ed25519 検証・クレーム表示 |
 

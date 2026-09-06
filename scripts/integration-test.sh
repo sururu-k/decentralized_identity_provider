@@ -337,13 +337,49 @@ ok "cnf.jkt (DPoP 束縛) がある"                         "$(verified cnf_jkt
 ok "sub を改竄すると署名検証が落ちる"                   "$(verified tampered_rejected)"
 
 # ---------------------------------------------------------------------------
-step "7. rp ランディングページ"
+step "7. rp ランディングページ (契約 第 13 節: DPoP 鍵は rp フロントが持つ)"
 http GET "$RP/"
 eq "GET / が 200" 200 "$HTTP_CODE"
 has "redirect_uri が rp 自身の /callback" \
   "redirect_uri=http%3A%2F%2Flocalhost%3A3001%2Fcallback" "$HTTP_BODY"
 has "response_mode=form_post" "response_mode=form_post" "$HTTP_BODY"
 has "認可エンドポイントが gateway" "http://localhost:3000/authorize" "$HTTP_BODY"
+has "WebCrypto で Ed25519 鍵を作るインライン JS がある" \
+  'crypto.subtle.generateKey({ name: "Ed25519" }, false,' "$HTTP_BODY"
+has "秘密鍵の保管先が IndexedDB の pasta-rp/dpop" 'var DB_NAME = "pasta-rp"' "$HTTP_BODY"
+has "authorize URL に dpop_jkt を組み立てる JS がある" \
+  '"&dpop_jkt=" + encodeURIComponent(jkt)' "$HTTP_BODY"
+has "jkt 確定前はログインリンクが無効" 'aria-disabled="true"' "$HTTP_BODY"
+has "画面に my DPoP jkt を表示する" "my DPoP jkt:" "$HTTP_BODY"
+
+# rp フロントが作るのと同じ形の jkt (base64url SHA-256, 43 文字)。ここでは Node の
+# crypto で {crv,kty,x} 辞書順 JSON を独立に計算する — rp のコードは参照しない。
+RP_JKT="$(node -e '
+  const c = require("crypto");
+  const k = c.generateKeyPairSync("ed25519");
+  const j = k.publicKey.export({ format: "jwk" });
+  const canonical = JSON.stringify({ crv: j.crv, kty: j.kty, x: j.x });
+  process.stdout.write(c.createHash("sha256").update(canonical).digest("base64url"));
+')"
+AUTHZ_QUERY="client_id=demo_client&redirect_uri=http%3A%2F%2Flocalhost%3A3001%2Fcallback"
+AUTHZ_QUERY="$AUTHZ_QUERY&response_type=id_token&response_mode=form_post&scope=openid"
+AUTHZ_QUERY="$AUTHZ_QUERY&nonce=it-authz-$$&state=it-state-$$"
+
+http GET "$GATEWAY/authorize?$AUTHZ_QUERY"
+eq "dpop_jkt 無しの /authorize は 400" 400 "$HTTP_CODE"
+has "400 の本文が理由を述べている" "Authorize Error:" "$HTTP_BODY"
+has "理由が dpop_jkt である" "dpop_jkt" "$HTTP_BODY"
+
+http GET "$GATEWAY/authorize?$AUTHZ_QUERY&dpop_jkt=${RP_JKT}A"
+eq "44 文字の dpop_jkt は 400" 400 "$HTTP_CODE"
+
+http GET "$GATEWAY/authorize?$AUTHZ_QUERY&dpop_jkt=$RP_JKT"
+eq "正しい dpop_jkt 付きの /authorize は 200" 200 "$HTTP_CODE"
+has "/demo への引き継ぎ URL に dpop_jkt が乗る" "dpop_jkt=$RP_JKT" "$HTTP_BODY"
+
+GW_AUTHZ_LOG="$(logs_of gateway | grep -- "authorize client_id=demo_client" | tail -1)"
+has "gateway のデモログに dpop_jkt の先頭 8 文字が出る" \
+  "dpop_jkt=${RP_JKT:0:8}" "$GW_AUTHZ_LOG"
 
 # ---------------------------------------------------------------------------
 step "8. rp /callback への form_post"

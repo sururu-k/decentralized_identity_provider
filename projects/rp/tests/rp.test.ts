@@ -189,6 +189,20 @@ describe("rp component e2e", () => {
     expect(html).toContain(`${ISSUER}/authorize?`);
   });
 
+  it("GET / ships the inline DPoP key logic and an inert login link", async () => {
+    const html = await (await fetch(`${rp.url}/`)).text();
+
+    // Section 13: the key pair is made here, and only its thumbprint travels.
+    expect(html).toContain("crypto.subtle.generateKey({ name: \"Ed25519\" }, false,");
+    expect(html).toContain('"&dpop_jkt=" + encodeURIComponent(jkt)');
+    expect(html).toContain("my DPoP jkt:");
+    // The authorize URL sits in a data attribute, so the button cannot be followed
+    // before dpop_jkt exists -- /authorize would answer 400.
+    expect(html).toContain('aria-disabled="true"');
+    expect(html).toContain("data-authorize-url=");
+    expect(html).not.toMatch(/<a class="login-btn"[^>]*\shref=/);
+  });
+
   it("GET / generates a fresh nonce and state per request", async () => {
     const extract = (html: string, key: string) =>
       new RegExp(`${key}=([A-Za-z0-9_-]+)`).exec(html)?.[1];
@@ -214,6 +228,20 @@ describe("rp component e2e", () => {
     // state is displayed, never enforced.
     expect(html).toContain("rp-demo-state");
     expect(html).not.toContain("認証失敗");
+  });
+
+  it("shows the token's cnf.jkt and compares it against the stored key", async () => {
+    const { status, html } = await postCallback(rp.url, {
+      id_token: signJwt(validPayload({ cnf: { jkt: "TFPUwd5DfQXkPCkjIrhAHTAb0JFnFHOoQOqFk3sGvEn" } })),
+    });
+
+    expect(status).toBe(200);
+    expect(html).toContain('data-cnf-jkt="TFPUwd5DfQXkPCkjIrhAHTAb0JFnFHOoQOqFk3sGvEn"');
+    expect(html).toContain('id="my-dpop-jkt"');
+    expect(html).toContain('id="jkt-match"');
+    // The comparison runs in the browser; the key never reaches this server.
+    expect(html).toContain("jkt === tokenJkt");
+    expect(html).toContain("crypto.subtle");
   });
 
   it("rejects a tampered payload", async () => {

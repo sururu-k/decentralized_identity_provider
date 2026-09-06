@@ -1,6 +1,5 @@
 import "./buffer-shim.js";
 import { ristretto255 } from "@noble/curves/ed25519";
-import { DPoPKeyPair, calculateJwkThumbprint, createDPoPProof, exportDPoPJwk, generateDPoPKeyPair } from "./dpop.js";
 import {
   aggregateSignatureShares,
   computeGroupCommitment,
@@ -42,6 +41,12 @@ export interface ClientRefreshOptions {
   clientId: string;
   nonce?: string;
   refreshEndpointUrl: string;
+  /**
+   * An RFC 9449 DPoP proof over `POST <refreshEndpointUrl>`, signed with the private key
+   * whose thumbprint is this SDK's `cnfJkt`. The caller makes it: since section 13 the
+   * key belongs to the RP front end, and this SDK never holds one.
+   */
+  dpopProof: string;
   participants?: number[];
   lifetimeSeconds?: number;
 }
@@ -51,7 +56,6 @@ export interface StoredSession {
   sub: string;
   nodeSecrets: Map<number, Uint8Array>; // nodeId -> rs_i
   counter: number;
-  dpopKeyPair: DPoPKeyPair;
   cnfJkt: string;
 }
 
@@ -59,13 +63,17 @@ export interface StoredSession {
  * Decentralized Client SDK
  *
  * Implements the browser/client-side aggregator from docs/whiteboard-gaps.md & docs/refresh-token.md:
- * 1. Manages ephemeral non-extractable DPoP keypair (Hole 4, 7)
- * 2. Blinds password locally via TOPRF (A = r * H1(pw)) and queries proxy (Hole 2: proxy never sees password, token, or h_i)
- * 3. Unblinds partial evaluations to reconstruct master PRF value h and derive h_i
- * 4. Decrypts ct_i locally using ChaCha20-Poly1305 with h_i
- * 5. Aggregates FROST Ed25519 threshold signature locally
- * 6. Stores session secrets rs_i locally for sender-constrained refresh (Hole 5)
- * 7. Generates RFC 9449 DPoP proofs for refresh requests
+ * 1. Blinds password locally via TOPRF (A = r * H1(pw)) and queries proxy (Hole 2: proxy never sees password, token, or h_i)
+ * 2. Unblinds partial evaluations to reconstruct master PRF value h and derive h_i
+ * 3. Decrypts ct_i locally using ChaCha20-Poly1305 with h_i
+ * 4. Aggregates FROST Ed25519 threshold signature locally
+ * 5. Stores session secrets rs_i locally for sender-constrained refresh (Hole 5)
+ *
+ * The DPoP key pair is *not* one of those responsibilities. Section 13 of
+ * docs/container-split.md moved it to the RP front end, which keeps the private key in its
+ * own origin's IndexedDB and passes only the thumbprint down the chain. This SDK therefore
+ * takes `cnfJkt` as a constructor argument and takes the DPoP proof for a refresh as a
+ * `refresh()` argument; it can neither mint a key nor sign a proof.
  *
  * Browser port of the gateway's `src/client-sdk/client.ts`
  * (docs/container-split.md section 11). What changed:
@@ -73,6 +81,8 @@ export interface StoredSession {
  * - The in-process `proxy` branch and the `PastaOAuthProxy` import are gone. This SDK
  *   only speaks HTTP, so `proxyUrl` is a required string and `""` means same origin
  *   (the reference treated `""` as "not configured" because it tested truthiness).
+ * - Key generation and proof creation moved out (section 13); `dpop.ts` itself is
+ *   unchanged and still serves the CLI stand-in, which plays the RP front end too.
  * - `crypto.randomBytes(16)` -> `globalThis.crypto.getRandomValues`.
  * - `JSON.parse(Buffer.from(bytes).toString("utf8"))` -> `TextDecoder`.
  * - An optional `onEvent` sink emits the section 10 demo log.
@@ -83,19 +93,18 @@ export interface StoredSession {
  */
 export class DecentralizedClientSdk {
   private config: ClientAuthConfig;
-  private dpopKeyPair: DPoPKeyPair;
+  /** The RP front end's DPoP thumbprint, received through the `/authorize` redirect. */
   public readonly cnfJkt: string;
   private currentSession: StoredSession | null = null;
 
-  constructor(config: ClientAuthConfig, dpopKeyPair?: DPoPKeyPair) {
+  constructor(config: ClientAuthConfig, cnfJkt: string) {
+    if (!cnfJkt) {
+      throw new Error(
+        "cnfJkt is required: the DPoP thumbprint comes from the RP front end via dpop_jkt"
+      );
+    }
     this.config = config;
-    this.dpopKeyPair = dpopKeyPair || generateDPoPKeyPair();
-    const jwk = exportDPoPJwk(this.dpopKeyPair.publicKey);
-    this.cnfJkt = calculateJwkThumbprint(jwk);
-  }
-
-  public getDPoPKeyPair(): DPoPKeyPair {
-    return this.dpopKeyPair;
+    this.cnfJkt = cnfJkt;
   }
 
   public getCurrentSession(): StoredSession | null {
@@ -136,7 +145,8 @@ export class DecentralizedClientSdk {
       "signon-blind",
       "sign-on",
       `user=${options.username} nonce=${options.nonce}  → r ${truncScalar(blinding.r)}  ` +
-        `A=r·H1(pw) ${trunc(blindedB64)}  jkt ${trunc(this.cnfJkt)}  nonce_s ${trunc(sessionNonceB64)}`
+        `A=r·H1(pw) ${trunc(blindedB64)}  jkt(rp) ${trunc(this.cnfJkt)}  ` +
+        `nonce_s ${trunc(sessionNonceB64)}`
     );
 
     let signOnResult: ProxySignOnResult;
@@ -244,7 +254,6 @@ export class DecentralizedClientSdk {
       sub,
       nodeSecrets,
       counter: 0,
-      dpopKeyPair: this.dpopKeyPair,
       cnfJkt: this.cnfJkt,
     };
 
@@ -253,10 +262,10 @@ export class DecentralizedClientSdk {
 
   /**
    * Execute Refresh Flow (Hole 5):
-   * 1. Generate RFC 9449 DPoP proof bound to current ephemeral key
-   * 2. Send refresh request with sessionId and DPoP proof to proxy
-   * 3. Nodes verify DPoP proof and encrypt new shares using rk_i = HKDF(rs_i, ctr)
-   * 4. Client decrypts new shares locally and aggregates fresh id_token JWT
+   * 1. Send `options.dpopProof` -- an RFC 9449 proof the caller signed with the key
+   *    behind `cnfJkt` -- together with the sessionId to the proxy
+   * 2. Nodes verify the DPoP proof and encrypt new shares using rk_i = HKDF(rs_i, ctr)
+   * 3. Client decrypts new shares locally and aggregates a fresh id_token JWT
    */
   public async refresh(
     options: ClientRefreshOptions
@@ -265,16 +274,15 @@ export class DecentralizedClientSdk {
       throw new Error("No active session in Client SDK. Sign-on required first.");
     }
 
+    if (!options.dpopProof) {
+      throw new Error("A DPoP proof is required for refresh; the SDK holds no signing key.");
+    }
+
     const nextCtr = this.currentSession.counter + 1;
     const now = Math.floor(Date.now() / 1000);
     const exp = now + (options.lifetimeSeconds ?? 3600);
 
-    // Create DPoP proof (Hole 4, 7)
-    const dpopProof = createDPoPProof(
-      this.currentSession.dpopKeyPair,
-      "POST",
-      options.refreshEndpointUrl
-    );
+    const dpopProof = options.dpopProof;
 
     let refreshResult: ProxyRefreshResult;
 

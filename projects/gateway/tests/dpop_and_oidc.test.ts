@@ -17,6 +17,9 @@ import { generateShamirShares, randomScalar } from "../src/crypto/frost.js";
  * HTTP against fake node servers instead of in-process `IdentityNode` objects.
  */
 
+/** A real RFC 7638 thumbprint: SHA-256, base64url, 43 characters (section 13). */
+const RP_JKT = "b0JFnFHOoQOqFk3sGvEnW6tC8VOBT9NIXtYjIrhAHTA";
+
 describe("DPoP (RFC 9449) & cnf.jkt (Holes 4 & 7)", () => {
   it("generates valid Ed25519 DPoP key pair and computes RFC 7638 thumbprint", () => {
     const keyPair = generateDPoPKeyPair();
@@ -143,8 +146,10 @@ describe("OIDC Gateway Endpoints (Holes 2 & 4)", () => {
       response_mode: "form_post",
       scope: "openid profile",
       nonce: "nonce123",
+      dpop_jkt: RP_JKT,
     });
     expect(valid.valid).toBe(true);
+    expect(valid.params?.dpopJkt).toBe(RP_JKT);
 
     const invalidMode = oidc.validateAuthorizeRequest({
       client_id: "test_client",
@@ -153,8 +158,54 @@ describe("OIDC Gateway Endpoints (Holes 2 & 4)", () => {
       response_mode: "query", // invalid: proxy cannot hold tokens (Hole 2)
       scope: "openid",
       nonce: "nonce123",
+      dpop_jkt: RP_JKT,
     });
     expect(invalidMode.valid).toBe(false);
     expect(invalidMode.error).toContain("only 'form_post' is supported");
+  });
+
+  describe("dpop_jkt (docs/container-split.md section 13)", () => {
+    const base = {
+      client_id: "test_client",
+      redirect_uri: "https://rp.example.com/cb",
+      response_type: "id_token",
+      response_mode: "form_post",
+      scope: "openid",
+      nonce: "nonce123",
+    };
+
+    it("requires it, because the RP front end owns the DPoP key", () => {
+      const result = oidc.validateAuthorizeRequest(base);
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain("dpop_jkt");
+    });
+
+    it("rejects anything that is not a 43-character base64url thumbprint", () => {
+      const bad = [
+        RP_JKT + "A", // 44 characters
+        RP_JKT.slice(0, 42), // 42 characters
+        RP_JKT.slice(0, 42) + "=", // padding is never part of a thumbprint
+        RP_JKT.slice(0, 42) + "+", // standard base64 alphabet, not base64url
+        RP_JKT.slice(0, 42) + "/",
+        "",
+      ];
+      for (const dpop_jkt of bad) {
+        const result = oidc.validateAuthorizeRequest({ ...base, dpop_jkt });
+        expect(result.valid, `expected ${JSON.stringify(dpop_jkt)} to be rejected`).toBe(false);
+        expect(result.error).toContain("dpop_jkt");
+      }
+    });
+
+    it("carries the thumbprint through to the demo URL verbatim", () => {
+      const html = oidc.renderAuthorizePage({
+        clientId: "test_client",
+        redirectUri: "https://rp.example.com/cb",
+        nonce: "nonce123",
+        state: "st",
+        scope: "openid",
+        dpopJkt: RP_JKT,
+      });
+      expect(html).toContain(`dpop_jkt=${RP_JKT}`);
+    });
   });
 });

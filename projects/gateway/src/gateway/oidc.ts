@@ -14,6 +14,7 @@ export interface AuthorizeQueryParams {
   scope?: string;
   state?: string;
   nonce?: string;
+  dpop_jkt?: string;
 }
 
 export interface AuthorizeValidationResult {
@@ -27,8 +28,16 @@ export interface AuthorizeValidationResult {
     scope: string;
     state?: string;
     nonce: string;
+    dpopJkt: string;
   };
 }
+
+/**
+ * `dpop_jkt` is the RFC 7638 thumbprint of the RP front end's DPoP public key: SHA-256
+ * base64url encoded, which is always 43 characters and never carries padding
+ * (docs/container-split.md section 13).
+ */
+const DPOP_JKT_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 
 export class OidcEndpointHandler {
   private issuer: string;
@@ -109,6 +118,20 @@ export class OidcEndpointHandler {
     if (!params.nonce) {
       return { valid: false, error: "Missing required parameter for id_token flow: nonce" };
     }
+    // Section 13: the DPoP key pair lives in the RP front end, so the RP -- not this
+    // gateway and not the demo UI -- decides which key the token gets bound to. Without a
+    // thumbprint there is nothing to bind, so the request is refused here rather than
+    // letting the demo UI invent a key of its own.
+    if (!params.dpop_jkt) {
+      return { valid: false, error: "Missing required parameter: dpop_jkt" };
+    }
+    if (!DPOP_JKT_PATTERN.test(params.dpop_jkt)) {
+      return {
+        valid: false,
+        error:
+          "Invalid dpop_jkt: expected a base64url SHA-256 JWK thumbprint (43 characters, no padding)",
+      };
+    }
 
     return {
       valid: true,
@@ -120,6 +143,7 @@ export class OidcEndpointHandler {
         scope: params.scope,
         state: params.state,
         nonce: params.nonce,
+        dpopJkt: params.dpop_jkt,
       },
     };
   }
@@ -129,10 +153,12 @@ export class OidcEndpointHandler {
    *
    * The browser executes the cryptographic client logic locally:
    * 1. Collects password (never sent to server in plaintext)
-   * 2. Generates ephemeral DPoP key
-   * 3. Relays blind sign-on query to /api/pasta/sign-on
-   * 4. Decrypts shares ct_i and aggregates Ed25519 signature
-   * 5. Performs response_mode=form_post directly to RP redirect_uri
+   * 2. Relays blind sign-on query to /api/pasta/sign-on
+   * 3. Decrypts shares ct_i and aggregates Ed25519 signature
+   * 4. Performs response_mode=form_post directly to RP redirect_uri
+   *
+   * The DPoP key is no longer among those steps: section 13 moved it to the RP front end,
+   * so `dpop_jkt` is carried through to the demo UI and used verbatim as `cnf.jkt`.
    */
   public renderAuthorizePage(params: {
     clientId: string;
@@ -140,6 +166,7 @@ export class OidcEndpointHandler {
     state?: string;
     nonce: string;
     scope: string;
+    dpopJkt: string;
   }): string {
     const demoUrl =
       `/demo?step=login` +
@@ -147,7 +174,8 @@ export class OidcEndpointHandler {
       `&client_id=${encodeURIComponent(params.clientId)}` +
       `&nonce=${encodeURIComponent(params.nonce)}` +
       `&state=${encodeURIComponent(params.state || '')}` +
-      `&scope=${encodeURIComponent(params.scope)}`;
+      `&scope=${encodeURIComponent(params.scope)}` +
+      `&dpop_jkt=${encodeURIComponent(params.dpopJkt)}`;
     return `<!DOCTYPE html>
 <html>
 <head>

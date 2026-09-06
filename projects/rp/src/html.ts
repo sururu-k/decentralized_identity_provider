@@ -38,9 +38,169 @@ const SHARED_HEAD_STYLE = `
       border-top: 1px solid #e2e8f0;
     }`;
 
+/**
+ * The DPoP key helper both rp pages inline.
+ *
+ * docs/container-split.md section 13: the DPoP key pair belongs to the rp front end.
+ * The private key is generated non-extractable with WebCrypto and kept in this origin's
+ * IndexedDB, so it never reaches the rp server, the gateway, the demo UI or a node. Only
+ * the RFC 7638 thumbprint of the public key travels, as `dpop_jkt` on `/authorize`.
+ *
+ * The thumbprint must match `calculateJwkThumbprint` on the node side byte for byte:
+ * SHA-256 over `{"crv":...,"kty":...,"x":...}` with the three members in lexicographic
+ * order and no whitespace, base64url encoded without padding.
+ *
+ * Written as ES5-style `var`/`function` plus `async`/`await` with no build step and no
+ * runtime dependency (contract section 7). It exposes `PastaDpop` and does nothing on
+ * load, so `projects/rp/tests/dpop-script.test.ts` can evaluate it under Node's WebCrypto.
+ */
+export const DPOP_SCRIPT = `
+var PastaDpop = (function () {
+  "use strict";
+
+  var DB_NAME = "pasta-rp";
+  var STORE_NAME = "dpop";
+  var KEY_NAME = "current";
+
+  function bytesToBase64Url(bytes) {
+    var binary = "";
+    for (var i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
+  }
+
+  /** RFC 7638 JWK thumbprint of an OKP/Ed25519 public JWK. */
+  async function jktFromJwk(jwk) {
+    var canonical = JSON.stringify({ crv: jwk.crv, kty: jwk.kty, x: jwk.x });
+    var digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
+    return bytesToBase64Url(new Uint8Array(digest));
+  }
+
+  function generateKeyPair() {
+    return crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign", "verify"]);
+  }
+
+  function openDb() {
+    return new Promise(function (resolve, reject) {
+      var request = indexedDB.open(DB_NAME, 1);
+      request.onupgradeneeded = function () {
+        var db = request.result;
+        if (!db.objectStoreNames.contains(STORE_NAME)) {
+          db.createObjectStore(STORE_NAME);
+        }
+      };
+      request.onsuccess = function () { resolve(request.result); };
+      request.onerror = function () { reject(request.error); };
+      request.onblocked = function () { reject(new Error("IndexedDB open blocked")); };
+    });
+  }
+
+  function idbGet(db, key) {
+    return new Promise(function (resolve, reject) {
+      var request = db.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).get(key);
+      request.onsuccess = function () { resolve(request.result); };
+      request.onerror = function () { reject(request.error); };
+    });
+  }
+
+  function idbPut(db, key, value) {
+    return new Promise(function (resolve, reject) {
+      var tx = db.transaction(STORE_NAME, "readwrite");
+      tx.objectStore(STORE_NAME).put(value, key);
+      tx.oncomplete = function () { resolve(); };
+      tx.onerror = function () { reject(tx.error); };
+      tx.onabort = function () { reject(tx.error); };
+    });
+  }
+
+  /** The stored key pair, or a freshly generated and stored one. */
+  async function ensureKeyPair() {
+    var db = await openDb();
+    try {
+      var stored = await idbGet(db, KEY_NAME);
+      if (stored && stored.privateKey && stored.publicKey) {
+        return stored;
+      }
+      var pair = await generateKeyPair();
+      await idbPut(db, KEY_NAME, { privateKey: pair.privateKey, publicKey: pair.publicKey });
+      return pair;
+    } finally {
+      db.close();
+    }
+  }
+
+  /** The thumbprint of the stored key, recomputed on every page load. */
+  async function ensureJkt() {
+    var pair = await ensureKeyPair();
+    var jwk = await crypto.subtle.exportKey("jwk", pair.publicKey);
+    return jktFromJwk(jwk);
+  }
+
+  function unavailableReason() {
+    if (typeof crypto === "undefined" || !crypto.subtle) {
+      return "このブラウザには WebCrypto (crypto.subtle) がありません。";
+    }
+    if (typeof indexedDB === "undefined") {
+      return "このブラウザでは IndexedDB を使えません。";
+    }
+    return "";
+  }
+
+  return {
+    jktFromJwk: jktFromJwk,
+    ensureKeyPair: ensureKeyPair,
+    ensureJkt: ensureJkt,
+    unavailableReason: unavailableReason
+  };
+})();
+`;
+
 export interface LandingParams {
   authorizeUrl: string;
 }
+
+/**
+ * Landing-page glue: resolve the DPoP thumbprint, then arm the login link.
+ *
+ * The anchor ships without an `href` and with `aria-disabled="true"`, so the login button
+ * is inert until `dpop_jkt` is known. `/authorize` rejects a request without it
+ * (contract section 6), so an armed link is the only link worth offering.
+ */
+const LANDING_SCRIPT = `
+(function () {
+  "use strict";
+  var button = document.getElementById("login-btn");
+  var label = document.getElementById("login-label");
+  var output = document.getElementById("dpop-jkt");
+  var reason = document.getElementById("dpop-reason");
+  var authorizeUrl = button.getAttribute("data-authorize-url");
+
+  function unavailable(message) {
+    output.textContent = "(未生成)";
+    label.textContent = "ログインできません";
+    reason.textContent = message;
+  }
+
+  var blocked = PastaDpop.unavailableReason();
+  if (blocked) {
+    unavailable(blocked);
+    return;
+  }
+
+  PastaDpop.ensureJkt().then(function (jkt) {
+    output.textContent = jkt;
+    button.setAttribute("href", authorizeUrl + "&dpop_jkt=" + encodeURIComponent(jkt));
+    button.removeAttribute("aria-disabled");
+    label.textContent = "PASTA IdP でログイン";
+  }).catch(function (err) {
+    unavailable(
+      "この環境の WebCrypto は Ed25519 の DPoP 鍵を作成できませんでした: " +
+        (err && err.message ? err.message : String(err))
+    );
+  });
+})();
+`;
 
 /** The ZK-App Portal landing page: a third-party service offering IdP login. */
 export function renderLandingPage(params: LandingParams): string {
@@ -106,6 +266,30 @@ export function renderLandingPage(params: LandingParams): string {
       text-align: center;
     }
     .feature strong { display: block; color: #1e293b; font-size: 0.875rem; margin-bottom: 0.25rem; }
+    .login-btn[aria-disabled="true"] {
+      background: #cbd5e1;
+      color: #64748b;
+      cursor: progress;
+      pointer-events: none;
+    }
+    .dpop {
+      margin-top: 1.75rem;
+      font-size: 0.8125rem;
+      color: #475569;
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      text-align: left;
+    }
+    .dpop code {
+      font-family: ui-monospace, monospace;
+      font-size: 0.75rem;
+      color: #1e293b;
+      word-break: break-all;
+    }
+    .dpop .reason { display: block; margin-top: 0.5rem; color: #b91c1c; }
+    .dpop .reason:empty { display: none; }
   </style>
 </head>
 <body>
@@ -123,12 +307,17 @@ export function renderLandingPage(params: LandingParams): string {
       <h1>ZK-App Portal へようこそ</h1>
       <p>このサービスは PASTA 分散 IdP による OpenID Connect 認証に対応しています。<br>
          OAuth プロキシが平文トークンを保持せず、ブラウザが端末内で署名を集約します。</p>
-      <a class="login-btn" href="${escapeHtml(params.authorizeUrl)}">
+      <a class="login-btn" id="login-btn" aria-disabled="true"
+         data-authorize-url="${escapeHtml(params.authorizeUrl)}">
         <svg width="18" height="18" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
           <path stroke-linecap="round" stroke-linejoin="round" d="M15 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0zM3 20a9 9 0 0 1 18 0"/>
         </svg>
-        PASTA IdP でログイン
+        <span id="login-label">DPoP 鍵を準備中...</span>
       </a>
+      <div class="dpop">
+        my DPoP jkt: <code id="dpop-jkt">(生成中)</code>
+        <span class="reason" id="dpop-reason"></span>
+      </div>
     </div>
     <div class="features">
       <div class="feature"><strong>秘密分散鍵</strong>単一障害点なし</div>
@@ -137,6 +326,8 @@ export function renderLandingPage(params: LandingParams): string {
     </div>
   </main>
   <footer>ZK-App Portal (RP デモ) — PASTA + FROST + OAuth Proxy</footer>
+  <script>${DPOP_SCRIPT}</script>
+  <script>${LANDING_SCRIPT}</script>
 </body>
 </html>`;
 }
@@ -156,6 +347,50 @@ function formatIat(payload: JwtPayload | null): string {
   return typeof iat === "number" ? new Date(iat * 1000).toLocaleString("ja-JP") : "-";
 }
 
+/**
+ * Callback-page glue: recompute the thumbprint of this origin's stored DPoP key and
+ * compare it with the `cnf.jkt` the server read out of the token.
+ *
+ * The comparison happens in the browser because that is the only place the key exists.
+ * The server never sees it: it renders `cnf.jkt` and an empty verdict slot, and this
+ * script fills the verdict in.
+ */
+const CALLBACK_SCRIPT = `
+(function () {
+  "use strict";
+  var mine = document.getElementById("my-dpop-jkt");
+  var verdict = document.getElementById("jkt-match");
+  var tokenJktEl = document.getElementById("token-cnf-jkt");
+  var tokenJkt = tokenJktEl ? tokenJktEl.getAttribute("data-cnf-jkt") : "";
+
+  function show(text, ok) {
+    verdict.textContent = text;
+    verdict.className = ok ? "jkt-ok" : "jkt-ng";
+  }
+
+  var blocked = PastaDpop.unavailableReason();
+  if (blocked) {
+    mine.textContent = "(取得できません)";
+    show("✖ " + blocked, false);
+    return;
+  }
+
+  PastaDpop.ensureJkt().then(function (jkt) {
+    mine.textContent = jkt;
+    if (!tokenJkt) {
+      show("✖ トークンに cnf.jkt がありません", false);
+    } else if (jkt === tokenJkt) {
+      show("✓ 一致 — この端末の DPoP 鍵にトークンが束縛されています", true);
+    } else {
+      show("✖ 不一致 — トークンは別の鍵に束縛されています", false);
+    }
+  }).catch(function (err) {
+    mine.textContent = "(取得できません)";
+    show("✖ DPoP 鍵を読み出せませんでした: " + (err && err.message ? err.message : String(err)), false);
+  });
+})();
+`;
+
 /** The post-login page: verification outcome plus the decoded claim set. */
 export function renderCallbackPage(params: CallbackParams): string {
   const { valid, payload, issuer } = params;
@@ -163,6 +398,14 @@ export function renderCallbackPage(params: CallbackParams): string {
   const iat = formatIat(payload);
   const nonce = payload?.nonce;
   const claimsJson = payload ? JSON.stringify(payload, null, 2) : "(トークンを解析できませんでした)";
+  // Section 13: the token's DPoP binding, shown so the inline script can compare it with
+  // the key this origin holds. A token without a `cnf.jkt` renders an empty attribute and
+  // the script reports the mismatch.
+  const cnf = payload?.cnf;
+  const cnfJkt =
+    cnf && typeof cnf === "object" && typeof (cnf as { jkt?: unknown }).jkt === "string"
+      ? (cnf as { jkt: string }).jkt
+      : "";
   const avatarInitial = String(sub).slice(4, 5).toUpperCase() || "U";
 
   const banner = valid
@@ -254,6 +497,8 @@ export function renderCallbackPage(params: CallbackParams): string {
     .back { display: inline-block; margin-top: 1.5rem; margin-right: 1.25rem; color: #6366f1; font-size: 0.875rem; font-weight: 500; text-decoration: none; }
     .back:hover { text-decoration: underline; }
     .note { font-size: 0.75rem; color: #94a3b8; margin-top: 1rem; line-height: 1.5; }
+    .jkt-ok { color: #15803d; font-weight: 600; }
+    .jkt-ng { color: #b91c1c; font-weight: 600; }
   </style>
 </head>
 <body>
@@ -273,6 +518,10 @@ ${banner}
         <tr><th>発行時刻 (iat)</th><td>${escapeHtml(iat)}</td></tr>
         <tr><th>署名検証</th><td>${valid ? "Ed25519 (EdDSA) — 有効" : "失敗: " + escapeHtml(params.error ?? "不明なエラー")}</td></tr>
         <tr><th>トークン配送経路</th><td>ブラウザ form_post (プロキシ非経由)</td></tr>
+        <tr><th>トークンの cnf.jkt</th>
+            <td id="token-cnf-jkt" data-cnf-jkt="${escapeHtml(cnfJkt)}">${cnfJkt ? escapeHtml(cnfJkt) : "(なし)"}</td></tr>
+        <tr><th>my DPoP jkt (この端末)</th><td id="my-dpop-jkt">(照合中)</td></tr>
+        <tr><th>DPoP 鍵の照合</th><td><span id="jkt-match">(照合中)</span></td></tr>
 ${optionalRows}
       </table>
       <details class="detail">
@@ -288,6 +537,8 @@ ${optionalRows}
     </div>
   </main>
   <footer>ZK-App Portal (RP デモ) — PASTA + FROST + OAuth Proxy</footer>
+  <script>${DPOP_SCRIPT}</script>
+  <script>${CALLBACK_SCRIPT}</script>
 </body>
 </html>`;
 }

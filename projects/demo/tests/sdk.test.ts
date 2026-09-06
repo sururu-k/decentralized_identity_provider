@@ -6,6 +6,7 @@ import {
   createSigningInput,
   deterministicJsonStringify,
 } from "../src/sdk/jwt.js";
+import { DecentralizedClientSdk } from "../src/sdk/client.js";
 import { calculateJwkThumbprint, exportDPoPJwk } from "../src/sdk/dpop.js";
 import { BrowserBuffer } from "../src/sdk/buffer-shim.js";
 
@@ -168,6 +169,38 @@ describe("DPoP thumbprint matches the Node implementation", () => {
       x: "Ag0YIy45RE9aZXB7hpGcp7K9yNPe6fT_ChUgKzZBTFc",
     });
     expect(calculateJwkThumbprint(jwk)).toBe("b0JFnFHOoQOqFk3sGvEnW6tC8VOBT9NIXtYjIrhAHTA");
+  });
+});
+
+describe("the SDK takes the DPoP thumbprint instead of making a key", () => {
+  const config = { proxyUrl: "http://gateway.test", issuer: "http://gateway.test" };
+  const jkt = "b0JFnFHOoQOqFk3sGvEnW6tC8VOBT9NIXtYjIrhAHTA";
+
+  it("uses the supplied thumbprint verbatim", () => {
+    // Section 13: this value came from the rp front end through /authorize, and the token
+    // must be bound to it rather than to anything this process generated.
+    expect(new DecentralizedClientSdk(config, jkt).cnfJkt).toBe(jkt);
+  });
+
+  it("refuses to run without one", () => {
+    expect(() => new DecentralizedClientSdk(config, "")).toThrow(/cnfJkt is required/);
+  });
+
+  it("exposes no key material at all", () => {
+    const sdk = new DecentralizedClientSdk(config, jkt) as unknown as Record<string, unknown>;
+    expect(sdk.getDPoPKeyPair).toBeUndefined();
+    expect(sdk.dpopKeyPair).toBeUndefined();
+  });
+
+  it("cannot refresh before a sign-on, proof or no proof", async () => {
+    const sdk = new DecentralizedClientSdk(config, jkt);
+    await expect(
+      sdk.refresh({
+        clientId: "demo_client",
+        refreshEndpointUrl: "http://gateway.test/api/pasta/refresh",
+        dpopProof: "not-reached",
+      })
+    ).rejects.toThrow(/Sign-on required first/);
   });
 });
 

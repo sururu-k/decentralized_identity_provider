@@ -33,6 +33,12 @@ export default function App() {
   const oauthClientId = urlParams?.get('client_id') || 'zk_app_portal';
   const oauthNonce = urlParams?.get('nonce') || ('demo_nonce_' + Math.random().toString(36).substring(7));
   const oauthState = urlParams?.get('state') || 'demo_state_xyz789';
+  // docs/container-split.md section 13: the DPoP key pair belongs to the rp front end.
+  // This page never makes one -- it only receives the thumbprint that /authorize carried
+  // through, and binds the token to it. Without it there is nothing to bind to.
+  const oauthDpopJkt = urlParams?.get('dpop_jkt') || null;
+  const MISSING_JKT_MESSAGE =
+    'rp から dpop_jkt が渡されていません。http://localhost:3001/ から開始してください。';
 
   const defaultMockToken =
     'eyJhbGciOiJFZERTQSIswitchInR5cCI6IkpXVCIsImtpZCI6InBhc3RhLWZyb3N0ZWQyNTUxOS1wazEifQ.eyJpc3MiOiJodHRwczovL2lkcC5wYXN0YS5leGFtcGxlIiwic3ViIjoidXNyX2FsaWNlXzEyMzQ1IiwiYXVkIjoiemtfYXBwX3BvcnRhbCIsImlhdCI6MTcyMTAxMDAwMCwiZXhwIjoxNzIxMDEzODAwLCJqdGkiOiJqdGlfZGVtb185OTkiLCJjbmYiOnsiamt0IjoiNmNQUU5JbWZiaHFtakh6NVhEOVU4MjZ1WllMNUtSNVNtOWJtM051UVhNIn19.dGVzdF9zaWduYXR1cmVfZm9yX2RlbW9fcGFzdGFfZm9yX3NjcmVlbnNob3Q';
@@ -78,8 +84,6 @@ export default function App() {
   // `?step=completed` / `?step=jwt` paints a canned token for screenshots. Cleared the
   // moment a real sign-on starts, and labelled on screen so it is never mistaken for one.
   const [isMockView, setIsMockView] = useState(initialStep === 'completed');
-  const [sdk, setSdk] = useState<DecentralizedClientSdk | null>(null);
-  const [isRefreshing, setIsRefreshing] = useState(false);
 
   const [nodes, setNodes] = useState<NodeStatus[]>([
     { id: 1, name: 'ノード 1 (東京)', region: 'ap-northeast-1', state: initialStep === 'completed' ? 'success' : 'idle' },
@@ -128,27 +132,31 @@ export default function App() {
   };
 
   const startSignOn = async () => {
+    if (!oauthDpopJkt) {
+      setError(MISSING_JKT_MESSAGE);
+      return;
+    }
+
     setStep('signing');
     setLogs([]);
     setError(null);
     setIsMockView(false);
     setIdToken(null);
     setDecodedToken(null);
-    setSdk(null);
     addLog('分散サインオン処理を開始します (PASTA + FROST)...');
-
-    // 1. Client-side ephemeral DPoP Key Generation (Hole 4 & 7)
-    addLog('端末内でRFC 9449 DPoP用の一時Ed25519キーペアを生成中...');
-    await new Promise((r) => setTimeout(r, 400));
 
     // The page is served by the gateway itself, so an empty proxyUrl means same origin
     // and window.location.origin is the ISSUER the gateway signs with.
-    const client = new DecentralizedClientSdk({
-      proxyUrl: '',
-      issuer: window.location.origin,
-      onEvent: handleDemoEvent,
-    });
-    addLog(`DPoP公開鍵サムプリント算出完了: cnf.jkt = ${client.cnfJkt}`);
+    const client = new DecentralizedClientSdk(
+      {
+        proxyUrl: '',
+        issuer: window.location.origin,
+        onEvent: handleDemoEvent,
+      },
+      oauthDpopJkt
+    );
+    addLog(`rp フロントから受け取った DPoP サムプリントに束縛します: cnf.jkt = ${client.cnfJkt}`);
+    addLog('この画面は DPoP 秘密鍵を持ちません。鍵は rp オリジンの IndexedDB にあります。');
 
     // 2. Client-side Password Blinding
     addLog('ブラウザ内でパスワードを目隠し暗号化: A = r * H1(pw) (Ristretto255群)...');
@@ -174,7 +182,6 @@ export default function App() {
       addLog('ラグランジュ補間係数を用いてFROST Schnorr署名を集約: z = sum(z_i)');
       addLog('標準Ed25519公開鍵で検証可能なIDトークンが完成しました！');
 
-      setSdk(client);
       setIdToken(id_token);
       setDecodedToken(decodeJwt(id_token));
       setNodes((prev) => prev.map((n) => ({ ...n, state: 'success' })));
@@ -185,31 +192,6 @@ export default function App() {
       setNodes((prev) => prev.map((n) => ({ ...n, state: 'idle' })));
       setError(message);
       setStep('login');
-    }
-  };
-
-  const runRefresh = async () => {
-    if (!sdk) return;
-    setIsRefreshing(true);
-    setError(null);
-    addLog('DPoP proof を作成し、同じ参加ノード集合へリフレッシュを要求します...');
-    try {
-      const { id_token } = await sdk.refresh({
-        clientId: oauthClientId,
-        nonce: oauthNonce,
-        refreshEndpointUrl: `${window.location.origin}/api/pasta/refresh`,
-      });
-      addLog('新しい ct_i を rk_i = HKDF(rs_i, ctr) で復号し、新しい id_token を集約しました。');
-      setIdToken(id_token);
-      setDecodedToken(decodeJwt(id_token));
-      setActiveTab('jwt');
-    } catch (err) {
-      const message =
-        err instanceof Error ? `リフレッシュに失敗しました: ${err.message}` : String(err);
-      addLog(message);
-      setError(message);
-    } finally {
-      setIsRefreshing(false);
     }
   };
 
@@ -305,6 +287,15 @@ export default function App() {
                 </div>
               )}
 
+              {/* Section 13: no dpop_jkt means no key to bind the token to, so the flow
+                  stops here rather than inventing one on this origin. */}
+              {!oauthDpopJkt && (
+                <div className="p-3 rounded-lg bg-amber-950/40 border border-amber-800/60 text-xs text-amber-200 flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+                  <span className="leading-relaxed">{MISSING_JKT_MESSAGE}</span>
+                </div>
+              )}
+
               <div>
                 <label className="block text-xs font-medium text-slate-400 mb-1.5">テストアカウント選択</label>
                 <div className="grid grid-cols-2 gap-2">
@@ -365,7 +356,9 @@ export default function App() {
 
               <button
                 onClick={() => setStep('consent')}
-                className="w-full py-3 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-sm transition flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/30 mt-2"
+                disabled={!oauthDpopJkt}
+                title={oauthDpopJkt ? undefined : MISSING_JKT_MESSAGE}
+                className="w-full py-3 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:shadow-none text-white font-semibold text-sm transition flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/30 mt-2"
               >
                 権限の確認へ進む
                 <ArrowRight className="w-4 h-4" />
@@ -385,7 +378,7 @@ export default function App() {
               {[
                 { id: 'openid', label: 'OpenID プロファイル', desc: 'FROST 定足数によって署名された標準 EdDSA (Ed25519) JWT IDトークン' },
                 { id: 'profile', label: 'ユーザー固有識別子 (sub)', desc: '分散IdP環境で決定論的に決定される一意な識別子 (usr_alice_12345)' },
-                { id: 'email', label: 'DPoP プルーフ束縛 (RFC 9449)', desc: 'ブラウザ内で生成された使い捨て公開鍵へのトークン厳格束縛 (cnf.jkt)' },
+                { id: 'email', label: 'DPoP プルーフ束縛 (RFC 9449)', desc: 'rp フロントが生成した公開鍵へのトークン厳格束縛 (cnf.jkt = dpop_jkt)' },
               ].map((item) => (
                 <div key={item.id} className="flex items-start gap-3 p-3 rounded-xl bg-slate-900/60 border border-slate-800">
                   <CheckCircle2 className="w-5 h-5 text-emerald-400 mt-0.5 flex-shrink-0" />
@@ -406,7 +399,9 @@ export default function App() {
               </button>
               <button
                 onClick={startSignOn}
-                className="flex-[2] py-2.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs transition shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-2"
+                disabled={!oauthDpopJkt}
+                title={oauthDpopJkt ? undefined : MISSING_JKT_MESSAGE}
+                className="flex-[2] py-2.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:shadow-none text-white font-semibold text-xs transition shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-2"
               >
                 <Key className="w-4 h-4" />
                 認可してトークンを発行
@@ -545,16 +540,6 @@ export default function App() {
 
                     {step === 'completed' && (
                       <div className="flex items-center gap-2">
-                        {sdk && (
-                          <button
-                            onClick={runRefresh}
-                            disabled={isRefreshing}
-                            className="py-2 px-4 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 font-semibold text-xs transition flex items-center gap-2 border border-slate-700"
-                          >
-                            <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
-                            {isRefreshing ? 'リフレッシュ中...' : 'DPoP リフレッシュ'}
-                          </button>
-                        )}
                         <button
                           onClick={submitFormPostToRp}
                           className="py-2 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs transition flex items-center gap-2 shadow-lg shadow-emerald-600/30"

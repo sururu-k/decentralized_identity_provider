@@ -184,7 +184,7 @@ node dist/index.js --out <dir> [--threshold 2] [--total 3] [--key-id pasta-group
 |---|---|---|
 | GET | `/.well-known/openid-configuration` | 既存 `OidcEndpointHandler` |
 | GET | `/jwks.json` | 同上 |
-| GET | `/authorize` | 既存通り検証して `/demo?step=login&redirect_uri=...` へ |
+| GET | `/authorize` | 既存通り検証して `/demo?step=login&redirect_uri=...` へ。`dpop_jkt` は必須 (`^[A-Za-z0-9_-]{43}$`、欠落・不正は 400) で、`/demo` の URL にそのまま引き継ぐ (第 13 節) |
 | POST | `/api/pasta/sign-on` | `ProxySignOnRequestBody` → `ProxySignOnResult` (b64u 化) |
 | POST | `/api/pasta/refresh` | `ProxyRefreshRequestBody` → `ProxyRefreshResult` (b64u 化) |
 | POST | `/demo/rp-callback` | 既存の簡易 RP 表示 (デモ UI の既定ターゲット) |
@@ -224,8 +224,8 @@ node dist/index.js --out <dir> [--threshold 2] [--total 3] [--key-id pasta-group
 
 | Method | Path | 備考 |
 |---|---|---|
-| GET | `/` | 既存 `/rp` の HTML。`redirect_uri` は `${RP_BASE_URL}/callback` |
-| POST | `/callback` | 既存 `/rp/callback` の HTML。`iss`, `aud`, `exp`, 署名を検証。`kid` で JWKS から鍵を選ぶ。JWKS は起動時ではなく初回要求時に取得しキャッシュ (未知 `kid` で再取得) |
+| GET | `/` | 既存 `/rp` の HTML。`redirect_uri` は `${RP_BASE_URL}/callback`。インライン JS が WebCrypto Ed25519 の DPoP 鍵を IndexedDB (`pasta-rp`/`dpop`) に用意し、jkt を画面に出してログインリンクに `&dpop_jkt=<jkt>` を付ける (第 13 節) |
+| POST | `/callback` | 既存 `/rp/callback` の HTML。`iss`, `aud`, `exp`, 署名を検証。`kid` で JWKS から鍵を選ぶ。JWKS は起動時ではなく初回要求時に取得しキャッシュ (未知 `kid` で再取得)。サーバはトークンの `cnf.jkt` を表示し、インライン JS が IndexedDB の鍵から再計算した jkt との一致を ✓/✖ で示す (鍵はサーバに送らない、第 13 節) |
 | GET | `/health` | `{ "status": "ok" }` |
 
 ステータスコード: 検証成功 200、署名・`iss`・`aud`・`exp`・未知 `kid`・`alg` 不正など検証失敗 401 (失敗 HTML)、`id_token` 欠落 400、リクエストボディ 1MB 超過 413、JWKS 取得不能 502。JWKS 取得失敗はキャッシュせず次回要求で再試行する。未知 `kid` での再取得は、キャッシュ済み文書に対してのみ 1 回行う (取得直後の文書に無い `kid` はそのまま 401)。`iat`/`nbf` は 60 秒のクロックスキューを許容する。未知 `kid` による再取得にレート制限は設けない (デモ範囲)。`nonce` と `state` は表示のみで照合しない (参照実装に合わせたデモとしての意図的な省略。gateway 側にもサーバ照合が無い)。HTML に埋め込むトークン由来の値はすべてエスケープする。
@@ -358,3 +358,55 @@ node dist/index.js --out <dir> [--threshold 2] [--total 3] [--key-id pasta-group
 gateway, rp の 5 ペインで `tiled` レイアウトに並べ、6 つ目のペインに CLI スタンドインの実行例を
 プロンプトに入れた shell を開く。`docker compose up -d --wait` 済みであることを前提にし、
 未起動なら起動を促す。各ペインのタイトルにサービス名を表示する (`set -g pane-border-status top`)。
+
+## 13. DPoP 鍵を rp フロントに移す (OAuth 化ステップ 1)
+
+決定 (2026-09-06): スコープは OIDC ではなく OAuth。id_token は将来のステップで廃止する。
+このステップでは **DPoP 鍵ペアの生成と保管を rp フロント (ブラウザ上の rp ページ) に移し**、
+gateway / gateway フロント (デモ UI) / node には公開鍵のサムプリント `jkt` だけを渡す。
+
+### 流れ (変わる箇所)
+
+```
+1. rp フロント                    ページ読み込み時に WebCrypto (Ed25519) で DPoP 鍵ペアを生成。
+                                  秘密鍵は rp オリジンの IndexedDB に extractable=false で保存。
+                                  公開 JWK の RFC 7638 サムプリント = jkt。
+2. rp フロント → gateway          GET /authorize?client_id&redirect_uri&response_type&response_mode&scope&nonce&state&dpop_jkt=<jkt>
+   gateway    → rp フロント       dpop_jkt を検証 (base64url 43 文字) し、/demo への引き継ぎ URL に dpop_jkt を含める
+3. gateway フロント               DPoP 鍵を生成しない。URL の dpop_jkt をそのまま cnfJkt に使う。無ければエラー表示。
+4. gateway フロント → gateway     POST /api/pasta/sign-on { ..., cnfJkt = dpop_jkt }
+   node                           変更なし (受け取った cnfJkt をセッションに束縛)
+7. gateway フロント               id_token を組み立てる (cnf.jkt = rp の鍵)
+8. gateway フロント → rp          form_post {id_token, state}
+9. rp        → rp フロント        検証結果を表示。rp フロントは保存鍵の jkt とトークンの cnf.jkt の一致を画面で示す。
+```
+
+### コンポーネント別
+
+- **rp**: ランディング HTML にインライン JS (依存ゼロ、ビルド無し)。`crypto.subtle.generateKey({name:"Ed25519"}, false, ["sign","verify"])`、
+  公開鍵を `exportKey("jwk")` して `{crv,kty,x}` を辞書順で JSON 化し SHA-256 → base64url = jkt (RFC 7638)。
+  秘密鍵 `CryptoKey` を IndexedDB (`pasta-rp` / store `dpop`) に保存。ログインボタンは jkt 計算完了後に有効化し、
+  `href` に `&dpop_jkt=<jkt>` を付ける。WebCrypto が Ed25519 非対応ならボタンを無効化して理由を表示。
+  `/callback` の HTML に「my DPoP jkt」と「token cnf.jkt」を並べ、インライン JS が一致を判定して ✓/✖ を表示
+  (サーバ側は cnf.jkt を表示するだけ。鍵はサーバに送らない)。
+- **gateway**: `/authorize` で `dpop_jkt` を **必須** とし、`^[A-Za-z0-9_-]{43}$` で検証 (欠落・不正は 400)。
+  `/demo?step=login&...&dpop_jkt=<jkt>` へ引き継ぐ。デモログ `authorize` 行に `dpop_jkt=<先頭8>` を追加。
+  `src/gateway/oidc.ts` は **このステップから byte 凍結の対象外** (OIDC のグルーコードであり暗号ではない)。
+  変更点 (`validateAuthorizeRequest` に `dpopJkt`、`renderAuthorizePage` の URL に `dpop_jkt`) を README に記録。
+- **gateway フロント (projects/demo)**: SDK の `DecentralizedClientSdk` から DPoP 鍵生成を外し、`cnfJkt: string` を
+  コンストラクタ引数で受ける。`dpop.ts` の鍵生成・proof 生成は SDK 本体から使わなくなる (CLI が使うので残す)。
+  `App.tsx` は URL の `dpop_jkt` を読み、無ければサインオンを開始せずエラーを表示。**リフレッシュボタンは削除**
+  (秘密鍵が rp フロントにしか無い。リフレッシュは後のステップで `/token` 側に移す)。SDK の `refresh()` は
+  DPoP proof を外部から受け取る形に変えるか、このステップでは CLI 専用として残す (いずれかを選び README に記す)。
+  ブラウザ列のデモログ `sign-on` 行の `jkt` は「rp から受領」と分かるよう `jkt(rp) <8>` と表記。
+- **CLI スタンドイン (projects/demo/cli/sign-on.ts)**: rp フロントと gateway フロントの両方を演じるので、自分で
+  DPoP 鍵を生成して `jkt` を SDK に渡す。`--refresh` は自前の鍵で proof を作って継続。`--jkt <値>` で外部指定も可 (秘密鍵が手元に無い想定なので `--refresh` との併用はエラー)。
+- **node**: 変更なし。
+- **総合テスト**: 既存ステップは CLI 経由なのでそのまま通るはず。追加: `/authorize` が `dpop_jkt` 欠落で 400、
+  正しい `dpop_jkt` 付きで 200 かつ応答に `dpop_jkt=` を含む。rp `/` の HTML に `dpop_jkt` を組み立てる JS が含まれる。
+- **README / 契約**: 第 6 節の `/authorize` 行と第 7 節の `/` の説明に `dpop_jkt` を追記 (実装エージェントが行う)。
+
+### 成立する性質
+
+DPoP 秘密鍵は rp フロントから出ない。gateway、gateway フロント、node が知るのは jkt だけで、
+id_token の `cnf.jkt` は最初から rp の鍵に束縛される。

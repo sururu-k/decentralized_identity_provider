@@ -52,6 +52,9 @@ afterAll(async () => {
   fs.rmSync(demoDist, { recursive: true, force: true });
 });
 
+/** A real RFC 7638 thumbprint: SHA-256, base64url, 43 characters (section 13). */
+const RP_JKT = "b0JFnFHOoQOqFk3sGvEnW6tC8VOBT9NIXtYjIrhAHTA";
+
 describe("node discovery", () => {
   it("learns each node id from /health rather than from NODE_URLS order", async () => {
     // The fake nodes bind ports in whatever order the OS hands them out, so the URL list
@@ -127,12 +130,15 @@ describe("OIDC endpoints", () => {
       scope: "openid profile",
       nonce: "n-authorize",
       state: "st-1",
+      dpop_jkt: RP_JKT,
     });
     const res = await getJson(gateway.url, `/authorize?${query}`);
     expect(res.status).toBe(200);
     expect(res.text).toContain("/demo?step=login");
     expect(res.text).toContain(encodeURIComponent("http://rp.example/callback"));
     expect(res.text).toContain("nonce=n-authorize");
+    // Section 13: the RP front end's thumbprint reaches the demo UI untouched.
+    expect(res.text).toContain(`dpop_jkt=${RP_JKT}`);
   });
 
   it("rejects /authorize without a nonce, and with a non form_post response_mode", async () => {
@@ -156,6 +162,28 @@ describe("OIDC endpoints", () => {
       "/authorize?client_id=c&redirect_uri=http://rp.example/cb&response_type=code&scope=openid&nonce=n"
     );
     expect(badType.status).toBe(400);
+  });
+
+  it("rejects /authorize when dpop_jkt is missing or malformed", async () => {
+    const base =
+      "/authorize?client_id=c&redirect_uri=http://rp.example/cb&response_type=id_token" +
+      "&response_mode=form_post&scope=openid&nonce=n";
+
+    const missing = await getJson(gateway.url, base);
+    expect(missing.status).toBe(400);
+    expect(missing.text).toContain("Authorize Error:");
+    expect(missing.text).toContain("dpop_jkt");
+
+    const tooLong = await getJson(gateway.url, `${base}&dpop_jkt=${RP_JKT}A`);
+    expect(tooLong.status).toBe(400);
+    expect(tooLong.text).toContain("dpop_jkt");
+
+    const padded = await getJson(
+      gateway.url,
+      `${base}&dpop_jkt=${encodeURIComponent(RP_JKT.slice(0, 42) + "=")}`
+    );
+    expect(padded.status).toBe(400);
+    expect(padded.text).toContain("dpop_jkt");
   });
 });
 
@@ -803,7 +831,8 @@ describe("demo log", () => {
       await getJson(
         gateway.url,
         "/authorize?client_id=demo_client&redirect_uri=http%3A%2F%2Frp.example%2Fcb" +
-          "&response_type=id_token&response_mode=form_post&scope=openid&nonce=n-authorize-log&state=st"
+          "&response_type=id_token&response_mode=form_post&scope=openid&nonce=n-authorize-log" +
+          `&state=st&dpop_jkt=${RP_JKT}`
       );
     } finally {
       spy.mockRestore();
@@ -812,7 +841,8 @@ describe("demo log", () => {
     expect(logs).toContain("[gateway] jwks      public only");
     expect(logs).toContain("[gateway] discovery public only");
     expect(logs).toContain(
-      "[gateway] authorize client_id=demo_client nonce=n-authorize-log state=st  → redirect /demo"
+      "[gateway] authorize client_id=demo_client nonce=n-authorize-log state=st " +
+        `dpop_jkt=${RP_JKT.slice(0, 8)}  → redirect /demo`
     );
   });
 });

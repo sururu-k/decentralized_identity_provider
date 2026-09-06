@@ -287,6 +287,7 @@ export function createGatewayServer(deps: GatewayDeps): http.Server {
           redirectUri: validation.params.redirectUri,
           nonce: validation.params.nonce,
           state: validation.params.state,
+          dpopJkt: validation.params.dpopJkt,
         });
 
         const html = oidc.renderAuthorizePage(validation.params);
