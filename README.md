@@ -236,11 +236,15 @@ docker compose down && rm -rf secrets
 
 #### 総合テスト
 
-compose 構成そのものを外側から検証するスクリプトです。起動から、**ブラウザ役 CLI**
-(`projects/demo/cli/sign-on.ts`) でのトークン取得、外部検証器 (`node:crypto` のみ、
-IdP コード不使用) による Ed25519 検証、rp への form_post、デモログの中身、DPoP
-リフレッシュ、誤パスワード、ノード 1 台停止での 2-of-3 継続、2 台停止での失敗、復旧、
-鍵の永続まで 120 項目を確認します (手元の Mac で約 75 秒)。
+compose 構成そのものを外側から検証するスクリプトです。OAuth 認可コードフロー + DPoP
+(契約 第 14 節) を外側から確認します。起動から、**ブラウザ役 CLI**
+(`projects/demo/cli/sign-on.ts`) での `access_token` 取得 (authorize→sign-on→code(アサーション)
+→`/token`)、外部検証器 (`node:crypto` のみ、IdP コード不使用) による Ed25519 検証
+(`typ=at+jwt`, `aud=demo_client`, `cnf.jkt`)、`refresh_token` grant、**DPoP 束縛**
+(proof 無しの `/token` は 400、別の鍵の proof も 400、`OPTIONS /token` の CORS が `DPoP` を許可)、
+誤パスワード (アサーションが作れず認可コードに至らない)、デモログの中身、
+ノード 1 台停止での 2-of-3 継続、2 台停止での失敗、復旧、鍵の永続まで 130 項目を確認します
+(手元の Mac で約 77 秒)。
 
 ```bash
 scripts/integration-test.sh
@@ -255,10 +259,9 @@ KEEP_UP=1 scripts/integration-test.sh
 
 デモログの検証ステップでは、`docker compose logs` を読んで次を確認します。
 
-- gateway の `sign-on   sess=<id>` の行に今回の `nonce` と `user=alice` が同居し、続く行に
-  中継の内訳 (`round1 (D,E)×3 → round2 … no h_i, cannot decrypt`) が出ている
-- node1..3 に **gateway と同じ `sess=`** の `sign-on` が出ている
-- rp に `callback` と `Ed25519 ✓`、`sub=usr_alice_12345` が出ている
+- gateway の `sign-on   sess=<id>` の行に今回の `nonce` と `user=alice`、パスワード非受領の印
+  (`(no pw)`) が同居し、`token grant=authz` の行に合成した `access_token` が出ている
+- node1..3 に `sign … grant=authz … assertion σ … ✓` の行が出ている (アサーションと DPoP proof を検証して署名)
 - **全サービスのログに `password123` が 0 件**、`secrets/node-1.json` の `secretKeyShare` の断片も 0 件
 - node3 を止めたときの gateway ログに `(node3 unreachable, excluded)` が出る
 
@@ -303,13 +306,14 @@ scripts/demo-tmux.sh     # tmux セッション pasta-demo を作って attach
 #### 3. ログインする
 
 ブラウザで [http://localhost:3001/](http://localhost:3001/) を開き、「PASTA IdP でログイン」
-から **alice / password123** でログインします (rp → gateway `/authorize` → デモ UI →
-form_post → rp `/callback` の一本道)。
+から **alice / password123** でログインします (rp → gateway `/authorize` → デモ UI で
+サインオン → 認可コード=アサーションを付けて rp `/callback` へ戻り、`/callback` の JS が
+DPoP proof 付きで `/token` を叩いて `access_token` を得る、という認可コードフロー)。
 
 rp のページを開いた時点で、そのページが DPoP 鍵ペアを作ります。秘密鍵は rp オリジンの
 IndexedDB に `extractable=false` で残り、IdP に渡るのは公開鍵のサムプリント `dpop_jkt`
 だけです (画面の「my DPoP jkt」)。デモ UI も gateway もノードもこの秘密鍵を持たないので、
-`id_token` の `cnf.jkt` は最初から rp の鍵に束縛されます。`/callback` の画面は、保管して
+`access_token` の `cnf.jkt` は最初から rp の鍵に束縛されます。`/callback` の画面は、保管して
 ある鍵から計算し直した jkt とトークンの `cnf.jkt` の一致を ✓ で示します。
 
 tmux の 6 つ目のペインで CLI を走らせても、**ブラウザと同じ SDK** が同じ順序で同じ計算を
@@ -321,7 +325,9 @@ cd projects/demo && npm run -s sign-on -- \
   --client-id demo_client --nonce demo-1
 ```
 
-`id_token` が stdout の最終行に、ブラウザ列のデモログが stderr に出ます。
+`access_token` が stdout の最終行に、ブラウザ列のデモログが stderr に出ます。`--refresh`
+を付けると、返ってきた `refresh_token` を新しい DPoP proof で `/token` に出して
+新しい `access_token` に差し替えます。
 
 #### 4. 各列の見どころ
 
@@ -481,7 +487,7 @@ cd projects/rp      && npm ci && npm test
 
 デモ・検証用のスクリプト:
 
-- [`scripts/integration-test.sh`](./scripts/integration-test.sh): compose 構成の総合テスト (120 項目、Node.js 20 以上が必要)
+- [`scripts/integration-test.sh`](./scripts/integration-test.sh): compose 構成の総合テスト (OAuth 認可コードフロー + DPoP、130 項目、Node.js 20 以上が必要)
 - [`scripts/demo-tmux.sh`](./scripts/demo-tmux.sh): node ×3 / gateway / rp のログを tmux で 5 列に並べ、6 つ目にブラウザ役 CLI を用意する
 - [`projects/demo/cli/sign-on.ts`](./projects/demo/cli/sign-on.ts): ブラウザ役 CLI スタンドイン (ブラウザと同じ SDK を Node で実行)
 

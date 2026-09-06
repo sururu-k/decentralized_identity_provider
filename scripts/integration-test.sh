@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 #
 # 総合テスト: docker-compose.yml で 4 コンポーネントを起動し、契約
-# (docs/container-split.md 第 8 節) の受け入れ条件を上から順に確認する。
+# (docs/container-split.md 第 14 節 OAuth 認可コードフロー) の成立する性質を上から順に確認する。
 #
 #   scripts/integration-test.sh
 #   KEEP_UP=1 scripts/integration-test.sh   # 終了時に compose を落とさない
 #
-# 「ブラウザ役」は CLI スタンドイン (第 11 節、projects/demo/cli/sign-on.ts)。
-# ブラウザで動くのと同じ SDK を Node で実行するので、**Node.js 20 以上が必要**。
-# projects/demo/node_modules が無ければこのスクリプトが npm ci する。
+# 「ブラウザ役」は CLI スタンドイン (第 11・13・14 節、projects/demo/cli/sign-on.ts)。
+# rp フロントと IdP フロントの両方を演じ、authorize→sign-on→code(アサーション)→/token を
+# 一気通貫して **access_token を stdout 最終行** に出す。ブラウザで動くのと同じ SDK を Node で
+# 実行するので **Node.js 20 以上が必要**。projects/demo/node_modules が無ければこのスクリプトが npm ci する。
 #
 # 終了時 (成功・失敗・中断いずれも) に `docker compose down` する。`--volumes` は
 # 付けないので、ホストの secrets/ は残る = 次回起動でも鍵は同じ。
@@ -19,7 +20,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 GATEWAY="http://localhost:3000"
+ISSUER="http://localhost:3000"
 RP="http://localhost:3001"
+CLIENT_ID="demo_client"
 EXPECTED_SUB="usr_alice_12345"
 EXPECTED_KID="pasta-group-key-1"
 ALL_SERVICES="dealer node1 node2 node3 gateway rp"
@@ -100,9 +103,10 @@ jsonget() {
   ' "$2"
 }
 
-# ブラウザ役 CLI スタンドイン (契約 第 11 節)。
+# ブラウザ役 CLI スタンドイン (契約 第 11・13・14 節)。
 #   sign_on <user> <password> <nonce> [--refresh ...]
-# 結果は SIGN_ON_TOKEN / SIGN_ON_STATUS / SIGN_ON_STDERR に入る。
+# authorize→sign-on→code(アサーション)→/token を通し access_token を返す。
+# 結果は SIGN_ON_TOKEN (access_token) / SIGN_ON_STATUS / SIGN_ON_STDERR に入る。
 # サブシェルで呼ぶと結果が伝わらないので `$(sign_on ...)` の形では使わないこと。
 SIGN_ON_TOKEN=""; SIGN_ON_STATUS=0; SIGN_ON_STDERR=""
 sign_on() {
@@ -114,13 +118,26 @@ sign_on() {
     cd "$ROOT/projects/demo" &&
       npm run -s sign-on -- \
         --gateway "$GATEWAY" --user "$user" --password "$password" \
-        --client-id demo_client --nonce "$nonce" "$@" 2>"$WORK/cli.err" |
+        --client-id "$CLIENT_ID" --nonce "$nonce" "$@" 2>"$WORK/cli.err" |
       tail -1
   )"
   SIGN_ON_STATUS=$?
   set -e
   SIGN_ON_TOKEN="$out"
   SIGN_ON_STDERR="$(cat "$WORK/cli.err" 2>/dev/null || true)"
+}
+
+# 認証アサーション (認可コード) だけを取り出す (--jkt: 秘密鍵は手元に無い想定)。
+# ASSERTION に入れる。
+mint_assertion() {
+  local user="$1" password="$2" nonce="$3" jkt="$4"
+  ASSERTION="$(
+    cd "$ROOT/projects/demo" &&
+      npm run -s sign-on -- \
+        --gateway "$GATEWAY" --user "$user" --password "$password" \
+        --client-id "$CLIENT_ID" --nonce "$nonce" --jkt "$jkt" 2>/dev/null |
+      tail -1
+  )"
 }
 
 # ANSI 色 (イメージは FORCE_COLOR=1 が既定) を落としてから grep する。
@@ -155,7 +172,7 @@ wait_healthy() {
   return 1
 }
 
-echo "PASTA 分散 IdP — docker compose 総合テスト"
+echo "PASTA 分散 IdP — docker compose 総合テスト (OAuth 認可コードフロー, 契約 第 14 節)"
 echo "リポジトリ: $ROOT"
 
 # ---------------------------------------------------------------------------
@@ -210,16 +227,23 @@ for f in group.json node-1.json node-2.json node-3.json; do
 done
 
 # ---------------------------------------------------------------------------
-step "2. OIDC Discovery"
+step "2. OAuth / OIDC Discovery (契約 第 14.4 節: response_types=[code], DPoP)"
 http GET "$GATEWAY/.well-known/openid-configuration"
 eq "GET /.well-known/openid-configuration が 200" 200 "$HTTP_CODE"
-eq "issuer が http://localhost:3000" "http://localhost:3000" "$(jsonget "$HTTP_BODY" 'd.issuer')"
+eq "issuer が $ISSUER" "$ISSUER" "$(jsonget "$HTTP_BODY" 'd.issuer')"
+eq "token_endpoint が $ISSUER/token" "$ISSUER/token" "$(jsonget "$HTTP_BODY" 'd.token_endpoint')"
 JWKS_URI="$(jsonget "$HTTP_BODY" 'd.jwks_uri')"
-eq "jwks_uri が http://localhost:3000/jwks.json" "http://localhost:3000/jwks.json" "$JWKS_URI"
-eq "id_token_signing_alg_values_supported に EdDSA" "EdDSA" "$(jsonget "$HTTP_BODY" 'd.id_token_signing_alg_values_supported.join(",")')"
+eq "jwks_uri が $ISSUER/jwks.json" "$ISSUER/jwks.json" "$JWKS_URI"
+eq "response_types_supported が [code]" "code" \
+  "$(jsonget "$HTTP_BODY" 'd.response_types_supported.join(",")')"
+GRANTS="$(jsonget "$HTTP_BODY" 'd.grant_types_supported.join(",")')"
+has "grant_types_supported に authorization_code" "authorization_code" "$GRANTS"
+has "grant_types_supported に refresh_token" "refresh_token" "$GRANTS"
+eq "dpop_signing_alg_values_supported が [EdDSA]" "EdDSA" \
+  "$(jsonget "$HTTP_BODY" 'd.dpop_signing_alg_values_supported.join(",")')"
 
 # ---------------------------------------------------------------------------
-step "3. JWKS"
+step "3. JWKS (グループ公開鍵)"
 http GET "$JWKS_URI"
 eq "GET /jwks.json が 200" 200 "$HTTP_CODE"
 JWKS_BODY="$HTTP_BODY"
@@ -253,28 +277,30 @@ for n in 1 2 3; do
 done
 
 # ---------------------------------------------------------------------------
-step "5. ブラウザ役 CLI スタンドインで id_token を取得"
+step "5. authorization_code grant — CLI で access_token を取得"
 NONCE="itest-$(node -e 'process.stdout.write(require("node:crypto").randomBytes(12).toString("hex"))')"
 sign_on alice password123 "$NONCE"
 ok "npm run sign-on が exit 0" "$SIGN_ON_STATUS"
-ID_TOKEN="$SIGN_ON_TOKEN"
-ok "stdout の最終行に id_token が出た" "$([ -n "$ID_TOKEN" ] && echo 0 || echo 1)"
-eq "id_token が 3 セグメントの JWS" "3" \
-  "$(printf '%s' "$ID_TOKEN" | awk -F. '{print NF}')"
+ACCESS_TOKEN="$SIGN_ON_TOKEN"
+ok "stdout の最終行に access_token が出た" "$([ -n "$ACCESS_TOKEN" ] && echo 0 || echo 1)"
+eq "access_token が 3 セグメントの JWS" "3" \
+  "$(printf '%s' "$ACCESS_TOKEN" | awk -F. '{print NF}')"
 has "stderr にブラウザ列のデモログが出ている" "[browser] sign-on   user=alice" "$SIGN_ON_STDERR"
-has "ブラウザ列に「この端末だけが組み立てた」印がある" \
-  "assembled only here" "$SIGN_ON_STDERR"
-hasnt "CLI の出力にパスワードが出ていない" "password123" "$SIGN_ON_STDERR$ID_TOKEN"
-printf '%s' "$ID_TOKEN" > "$WORK/token.txt"
+has "ブラウザ列にアサーション (=認可コード) 生成の印がある" \
+  "assertion" "$SIGN_ON_STDERR"
+has "ブラウザ列に /token grant=authorization_code のイベントがある" \
+  "grant=authorization_code" "$SIGN_ON_STDERR"
+hasnt "CLI の出力にパスワードが出ていない" "password123" "$SIGN_ON_STDERR$ACCESS_TOKEN"
+printf '%s' "$ACCESS_TOKEN" > "$WORK/token.txt"
 
 # ---------------------------------------------------------------------------
-step "6. 外部検証器 (node:crypto、IdP コード不使用) で id_token を検証"
+step "6. 外部検証器 (node:crypto、IdP コード不使用) で access_token を検証"
 cat > "$WORK/verify.mjs" <<'VERIFY_EOF'
 // IdP の実装を一切読み込まない独立検証器。node:crypto の Ed25519 だけで JWS を検証する。
 import { readFileSync } from "node:fs";
 import { verify } from "node:crypto";
 
-const [tokenPath, jwksPath, wantIss, wantAud, wantSub, wantNonce] = process.argv.slice(2);
+const [tokenPath, jwksPath, wantIss, wantAud, wantSub] = process.argv.slice(2);
 const token = readFileSync(tokenPath, "utf8").trim();
 const jwks = JSON.parse(readFileSync(jwksPath, "utf8"));
 
@@ -297,6 +323,7 @@ try {
 record("payload_json", payloadParsed);
 
 record("alg_eddsa", header.alg === "EdDSA");
+record("typ_at_jwt", header.typ === "at+jwt");
 const jwk = jwks.keys.find((k) => k.kid === header.kid);
 record("kid_in_jwks", Boolean(jwk));
 
@@ -308,11 +335,11 @@ record("signature", Boolean(jwk) && verifyWith(`${h}.${p}`, b64uToBuf(s)));
 record("iss", payload?.iss === wantIss);
 record("aud", payload?.aud === wantAud);
 record("sub", payload?.sub === wantSub);
-record("nonce", payload?.nonce === wantNonce);
 record("exp_future", typeof payload?.exp === "number" && payload.exp > Math.floor(Date.now() / 1000));
+record("exp_gt_iat", typeof payload?.exp === "number" && typeof payload?.iat === "number" && payload.exp > payload.iat);
 record("cnf_jkt", typeof payload?.cnf?.jkt === "string" && payload.cnf.jkt.length > 0);
 
-// sub を改竄したトークンは検証に失敗しなければならない。
+// sub を改竄したトークンは検証に失敗しなければならない (署名はそのまま)。
 const tampered = { ...payload, sub: "usr_mallory_00000" };
 const tamperedP = bufToB64u(Buffer.from(JSON.stringify(tampered), "utf8"));
 record("tampered_rejected", Boolean(jwk) && !verifyWith(`${h}.${tamperedP}`, b64uToBuf(s)));
@@ -321,136 +348,154 @@ process.stdout.write(results.join("\n"));
 VERIFY_EOF
 
 VERIFY_OUT="$(node "$WORK/verify.mjs" "$WORK/token.txt" "$WORK/jwks.json" \
-  "http://localhost:3000" "demo_client" "$EXPECTED_SUB" "$NONCE")"
+  "$ISSUER" "$CLIENT_ID" "$EXPECTED_SUB")"
 
 verified() { printf '%s\n' "$VERIFY_OUT" | grep -qx "$1=true" && echo 0 || echo 1; }
 ok "ペイロードが JSON.parse できる"                     "$(verified payload_json)"
 ok "ヘッダの alg が EdDSA"                              "$(verified alg_eddsa)"
+ok "ヘッダの typ が at+jwt (アクセストークン)"          "$(verified typ_at_jwt)"
 ok "ヘッダの kid が JWKS に存在する"                    "$(verified kid_in_jwks)"
 ok "Ed25519 署名が JWKS の鍵で検証できる"               "$(verified signature)"
-ok "iss が http://localhost:3000"                       "$(verified iss)"
-ok "aud が demo_client"                                 "$(verified aud)"
+ok "iss が $ISSUER"                                     "$(verified iss)"
+ok "aud が $CLIENT_ID"                                  "$(verified aud)"
 ok "sub が $EXPECTED_SUB"                               "$(verified sub)"
-ok "nonce がリクエストと一致する"                       "$(verified nonce)"
 ok "exp が未来"                                         "$(verified exp_future)"
+ok "exp > iat"                                          "$(verified exp_gt_iat)"
 ok "cnf.jkt (DPoP 束縛) がある"                         "$(verified cnf_jkt)"
 ok "sub を改竄すると署名検証が落ちる"                   "$(verified tampered_rejected)"
 
 # ---------------------------------------------------------------------------
-step "7. rp ランディングページ (契約 第 13 節: DPoP 鍵は rp フロントが持つ)"
+step "7. refresh_token grant — 新 access_token も JWKS で検証できる"
+REFRESH_NONCE="itest-refresh-$$"
+sign_on alice password123 "$REFRESH_NONCE" --refresh
+ok "npm run sign-on -- --refresh が exit 0" "$SIGN_ON_STATUS"
+REFRESHED_TOKEN="$SIGN_ON_TOKEN"
+ok "リフレッシュ後の access_token が返った" "$([ -n "$REFRESHED_TOKEN" ] && echo 0 || echo 1)"
+ok "リフレッシュ前後でトークンが違う" \
+  "$([ "$REFRESHED_TOKEN" != "$ACCESS_TOKEN" ] && echo 0 || echo 1)"
+has "ブラウザ列に refresh grant のイベントが出ている" "grant=refresh_token" "$SIGN_ON_STDERR"
+
+printf '%s' "$REFRESHED_TOKEN" > "$WORK/refreshed.txt"
+VERIFY_OUT="$(node "$WORK/verify.mjs" "$WORK/refreshed.txt" "$WORK/jwks.json" \
+  "$ISSUER" "$CLIENT_ID" "$EXPECTED_SUB")"
+ok "リフレッシュ後の typ が at+jwt"                       "$(verified typ_at_jwt)"
+ok "リフレッシュ後の Ed25519 署名が JWKS の鍵で検証できる" "$(verified signature)"
+ok "リフレッシュ後も sub が $EXPECTED_SUB"                "$(verified sub)"
+ok "リフレッシュ後も aud が $CLIENT_ID"                   "$(verified aud)"
+ok "リフレッシュ後も cnf.jkt がある"                      "$(verified cnf_jkt)"
+ok "リフレッシュ後の exp が未来"                          "$(verified exp_future)"
+
+# ---------------------------------------------------------------------------
+step "8. DPoP 束縛の確認 (契約 第 14 節の肝) — proof 無しでは発行されない"
+# (a) proof 無しで /token を叩くと 400 (invalid_dpop_proof)。
+http POST "$GATEWAY/token" \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data 'grant_type=authorization_code&code=x&client_id=demo_client'
+eq "proof 無しの /token は 400" 400 "$HTTP_CODE"
+has "エラーが invalid_dpop_proof" "invalid_dpop_proof" "$HTTP_BODY"
+
+# (b) 別の鍵の proof + 正当な code は 400 (proof の jkt ≠ アサーションの cnf.jkt)。
+EXT_JKT="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("base64url"))')"
+mint_assertion alice password123 "itest-dpop-$$" "$EXT_JKT"
+ok "外部 jkt に束縛したアサーション (code) を取得できた" \
+  "$([ "$(printf '%s' "$ASSERTION" | awk -F. '{print NF}')" -eq 3 ] && echo 0 || echo 1)"
+WRONG_PROOF="$(node -e '
+  const c = require("node:crypto");
+  const { publicKey, privateKey } = c.generateKeyPairSync("ed25519");
+  const jwk = publicKey.export({ format: "jwk" });
+  const b64u = (b) => Buffer.from(b).toString("base64url");
+  const h = { typ: "dpop+jwt", alg: "EdDSA", jwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x } };
+  const p = { jti: c.randomBytes(16).toString("base64url"), htm: "POST",
+    htu: "'"$ISSUER"'/token", iat: Math.floor(Date.now() / 1000) };
+  const si = b64u(JSON.stringify(h)) + "." + b64u(JSON.stringify(p));
+  const sig = c.sign(null, Buffer.from(si), privateKey);
+  process.stdout.write(si + "." + b64u(sig));
+')"
+http POST "$GATEWAY/token" \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -H "DPoP: $WRONG_PROOF" \
+  --data-urlencode "grant_type=authorization_code" \
+  --data-urlencode "code=$ASSERTION" \
+  --data-urlencode "client_id=$CLIENT_ID" \
+  --data-urlencode "redirect_uri=$RP/callback"
+eq "別の鍵の proof + 正当な code は 400" 400 "$HTTP_CODE"
+has "エラーが invalid_dpop_proof (jkt 不一致)" "invalid_dpop_proof" "$HTTP_BODY"
+
+# (c) gateway の OPTIONS /token が CORS プリフライトで DPoP を許可する (契約 第 14.4 節)。
+http OPTIONS "$GATEWAY/token" \
+  -D "$WORK/cors.hdr" \
+  -H 'Origin: http://localhost:3001' \
+  -H 'Access-Control-Request-Method: POST' \
+  -H 'Access-Control-Request-Headers: DPoP'
+CORS_ALLOW_HEADERS="$(grep -i '^access-control-allow-headers:' "$WORK/cors.hdr" || true)"
+has "OPTIONS /token の Allow-Headers に DPoP がある" "DPoP" "$CORS_ALLOW_HEADERS"
+CORS_ALLOW_METHODS="$(grep -i '^access-control-allow-methods:' "$WORK/cors.hdr" || true)"
+has "OPTIONS /token の Allow-Methods に POST がある" "POST" "$CORS_ALLOW_METHODS"
+
+# ---------------------------------------------------------------------------
+step "9. 誤ったパスワード — アサーションが作れず認可コードに至らない"
+sign_on alice wrong "itest-bad-$$"
+ok "誤パスワードで CLI が exit 1" "$([ "$SIGN_ON_STATUS" -ne 0 ] && echo 0 || echo 1)"
+ok "access_token が出ていない" "$([ -z "$SIGN_ON_TOKEN" ] && echo 0 || echo 1)"
+has "ブラウザ列に復号失敗の印がある" "ct_1 decrypt failed" "$SIGN_ON_STDERR"
+has "「ノードは成否を知らない」が出ている" "nodes cannot tell" "$SIGN_ON_STDERR"
+
+http GET "$GATEWAY/health"
+eq "誤パスワードでも gateway は正常なまま (ノード側はエラーにならない)" 200 "$HTTP_CODE"
+
+# ---------------------------------------------------------------------------
+step "10. rp ランディング / コールバック (契約 第 7・14 節: HTML 配信のみ)"
 http GET "$RP/"
 eq "GET / が 200" 200 "$HTTP_CODE"
+has "authorize URL が response_type=code" "response_type=code" "$HTTP_BODY"
 has "redirect_uri が rp 自身の /callback" \
   "redirect_uri=http%3A%2F%2Flocalhost%3A3001%2Fcallback" "$HTTP_BODY"
-has "response_mode=form_post" "response_mode=form_post" "$HTTP_BODY"
 has "認可エンドポイントが gateway" "http://localhost:3000/authorize" "$HTTP_BODY"
-has "WebCrypto で Ed25519 鍵を作るインライン JS がある" \
-  'crypto.subtle.generateKey({ name: "Ed25519" }, false,' "$HTTP_BODY"
-has "秘密鍵の保管先が IndexedDB の pasta-rp/dpop" 'var DB_NAME = "pasta-rp"' "$HTTP_BODY"
+has "WebCrypto で Ed25519 の DPoP 鍵を作るインライン JS がある" \
+  'generateKey({ name: "Ed25519" }' "$HTTP_BODY"
+has "秘密鍵の保管先が IndexedDB の pasta-rp" 'var DB_NAME = "pasta-rp"' "$HTTP_BODY"
 has "authorize URL に dpop_jkt を組み立てる JS がある" \
   '"&dpop_jkt=" + encodeURIComponent(jkt)' "$HTTP_BODY"
 has "jkt 確定前はログインリンクが無効" 'aria-disabled="true"' "$HTTP_BODY"
-has "画面に my DPoP jkt を表示する" "my DPoP jkt:" "$HTTP_BODY"
 
-# rp フロントが作るのと同じ形の jkt (base64url SHA-256, 43 文字)。ここでは Node の
-# crypto で {crv,kty,x} 辞書順 JSON を独立に計算する — rp のコードは参照しない。
-RP_JKT="$(node -e '
-  const c = require("crypto");
-  const k = c.generateKeyPairSync("ed25519");
-  const j = k.publicKey.export({ format: "jwk" });
-  const canonical = JSON.stringify({ crv: j.crv, kty: j.kty, x: j.x });
-  process.stdout.write(c.createHash("sha256").update(canonical).digest("base64url"));
-')"
-AUTHZ_QUERY="client_id=demo_client&redirect_uri=http%3A%2F%2Flocalhost%3A3001%2Fcallback"
-AUTHZ_QUERY="$AUTHZ_QUERY&response_type=id_token&response_mode=form_post&scope=openid"
-AUTHZ_QUERY="$AUTHZ_QUERY&nonce=it-authz-$$&state=it-state-$$"
+http GET "$RP/callback?code=aaa.bbb.ccc&state=itest-cb-$$"
+eq "GET /callback?code&state が 200" 200 "$HTTP_CODE"
+has "code が data-code に埋まっている" "data-code=" "$HTTP_BODY"
 
-http GET "$GATEWAY/authorize?$AUTHZ_QUERY"
-eq "dpop_jkt 無しの /authorize は 400" 400 "$HTTP_CODE"
-has "400 の本文が理由を述べている" "Authorize Error:" "$HTTP_BODY"
-has "理由が dpop_jkt である" "dpop_jkt" "$HTTP_BODY"
+http GET "$RP/callback?error=access_denied&state=itest-cb-$$"
+eq "GET /callback?error=... が 400" 400 "$HTTP_CODE"
 
-http GET "$GATEWAY/authorize?$AUTHZ_QUERY&dpop_jkt=${RP_JKT}A"
-eq "44 文字の dpop_jkt は 400" 400 "$HTTP_CODE"
-
-http GET "$GATEWAY/authorize?$AUTHZ_QUERY&dpop_jkt=$RP_JKT"
-eq "正しい dpop_jkt 付きの /authorize は 200" 200 "$HTTP_CODE"
-has "/demo への引き継ぎ URL に dpop_jkt が乗る" "dpop_jkt=$RP_JKT" "$HTTP_BODY"
-
-GW_AUTHZ_LOG="$(logs_of gateway | grep -- "authorize client_id=demo_client" | tail -1)"
-has "gateway のデモログに dpop_jkt の先頭 8 文字が出る" \
-  "dpop_jkt=${RP_JKT:0:8}" "$GW_AUTHZ_LOG"
+http GET "$RP/callback"
+eq "GET /callback (code も error も無し) が 400" 400 "$HTTP_CODE"
 
 # ---------------------------------------------------------------------------
-step "8. rp /callback への form_post"
-http POST "$RP/callback" \
-  --data-urlencode "id_token=$ID_TOKEN" --data-urlencode "state=rp-demo"
-eq "正当な id_token で 200" 200 "$HTTP_CODE"
-has "成功表示が出ている" "認証成功" "$HTTP_BODY"
-has "sub が表示されている" "$EXPECTED_SUB" "$HTTP_BODY"
-has "state が表示されている" "rp-demo" "$HTTP_BODY"
-
-TAMPERED_TOKEN="$(node -e '
-  const [h, p, s] = process.argv[1].split(".");
-  const b = Buffer.from(p.replace(/-/g, "+").replace(/_/g, "/"), "base64");
-  const o = JSON.parse(b.toString("utf8"));
-  o.sub = "usr_mallory_00000";
-  const np = Buffer.from(JSON.stringify(o), "utf8").toString("base64")
-    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  process.stdout.write([h, np, s].join("."));
-' "$ID_TOKEN")"
-http POST "$RP/callback" \
-  --data-urlencode "id_token=$TAMPERED_TOKEN" --data-urlencode "state=rp-demo"
-eq "改竄した id_token で 401" 401 "$HTTP_CODE"
-has "失敗表示が出ている" "認証失敗" "$HTTP_BODY"
-
-http POST "$RP/callback" --data-urlencode "state=rp-demo"
-eq "id_token 欠落で 400" 400 "$HTTP_CODE"
-
-# ---------------------------------------------------------------------------
-step "9. デモログ (契約 第 10 節) — 各列が何を知っているか"
+step "11. デモログ (契約 第 10 節) — 各列が何を知っているか"
 LOG_NONCE="itlog-$$-${RANDOM}"
-LOG_STATE="itlog-state-$$"
 sign_on alice password123 "$LOG_NONCE"
 ok "デモログ検証用のサインオンが成功した" "$SIGN_ON_STATUS"
-LOG_TOKEN="$SIGN_ON_TOKEN"
-http POST "$RP/callback" \
-  --data-urlencode "id_token=$LOG_TOKEN" --data-urlencode "state=$LOG_STATE"
-eq "デモログ検証用のトークンを rp が受理した" 200 "$HTTP_CODE"
 
-# (a) gateway の sign-on 1 行に今回の nonce と session id が同居する
-GW_BLOCK="$(logs_of gateway | grep -A1 -- "nonce=$LOG_NONCE" || true)"
-GW_HEAD="$(printf '%s\n' "$GW_BLOCK" | grep -- "sign-on   sess=" | head -1)"
-has "gateway に sign-on の 1 行目が出ている" "[gateway] sign-on   sess=" "$GW_HEAD"
-has "その同じ行に今回の nonce がある" "nonce=$LOG_NONCE" "$GW_HEAD"
-has "その同じ行に user=alice がある" "user=alice" "$GW_HEAD"
-has "パスワードを受け取っていないと書いてある" "(no pw)" "$GW_HEAD"
-has "2 行目に中継の内訳が出ている" "round1 (D,E)×3 → round2" "$GW_BLOCK"
-has "2 行目に「復号できない」と書いてある" "no h_i, cannot decrypt" "$GW_BLOCK"
+# (a) gateway に今回の nonce の sign-on 行と、token 行 (grant=authz + access_token)。
+GW_SIGNON="$(logs_of gateway | grep -- "nonce=$LOG_NONCE" | grep -- "sign-on" | tail -1)"
+has "gateway に今回の sign-on 行が出ている" "[gateway] sign-on" "$GW_SIGNON"
+has "その行に user=alice がある" "user=alice" "$GW_SIGNON"
+has "その行にパスワードを受け取っていない印 (no pw) がある" "(no pw)" "$GW_SIGNON"
+GW_TOKEN="$(logs_of gateway | grep -E 'token .*grant=authz' | tail -1)"
+has "gateway に token grant=authz の行が出ている" "grant=authz" "$GW_TOKEN"
+has "その token 行に合成した access_token が出ている" "access_token " "$GW_TOKEN"
 
-# (b) node1..3 に同じ session id の sign-on
-SESSION="$(printf '%s' "$GW_HEAD" | sed -n 's/.*sess=\([0-9a-zA-Z_-]*\).*/\1/p' | head -1)"
-ok "gateway の 1 行目から session id を取れた" "$([ -n "$SESSION" ] && echo 0 || echo 1)"
+# (b) node1..3 に sign (grant=authz) 行と、起動行の never 宣言。
 for n in 1 2 3; do
-  NODE_BLOCK="$(logs_of "node$n" | grep -A1 -- "sign-on   sess=$SESSION" || true)"
-  has "node$n に sess=$SESSION の sign-on がある" "[node$n]   sign-on   sess=$SESSION" "$NODE_BLOCK"
-  has "node$n の 2 行目に B_$n と ct_$n がある" "ct_${n}=AEAD_h${n}(z_${n}‖rs_${n})" "$NODE_BLOCK"
-  has "node$n が起動行で never を宣言している" "never: pw, h, other s_i/k_i, id_token" \
-    "$(logs_of "node$n")"
+  NODE_SIGN="$(logs_of "node$n" | grep -E 'sign +round=.*grant=authz' | tail -1)"
+  has "node$n に sign (grant=authz) 行が出ている" "grant=authz" "$NODE_SIGN"
+  has "node$n の sign 行にアサーション署名の検証印がある" "assertion" "$NODE_SIGN"
+  has "node$n が起動行で never を宣言している" \
+    "never: pw, h, other s_i/k_i" "$(logs_of "node$n")"
 done
 
-# (c) rp に callback と Ed25519 ✓
-RP_BLOCK="$(logs_of rp | grep -A1 -- "state=$LOG_STATE" || true)"
-has "rp に callback の 1 行目が出ている" "[rp]      callback  state=$LOG_STATE" "$RP_BLOCK"
-has "rp の 2 行目に Ed25519 ✓ がある" "Ed25519 ✓" "$RP_BLOCK"
-has "rp の 2 行目に sub がある" "sub=$EXPECTED_SUB" "$RP_BLOCK"
-has "rp の 1 行目に「gateway を経由していない」がある" \
-  "direct from browser, not via gateway" "$RP_BLOCK"
-
-# (d) パスワードがどのログにも出ていない
+# (c) パスワードがどのログにも出ていない。
 eq "全サービスのログに password123 が 0 件" "0" "$(count_all 'password123')"
 
-# (e) 長期秘密 (secretKeyShare) の先頭 16 文字がどのログにも出ていない
+# (d) 長期秘密 (secretKeyShare) の先頭 16 文字がどのログにも出ていない。
 SK_PREFIX="$(node -e '
   const fs = require("node:fs");
   const j = JSON.parse(fs.readFileSync("secrets/node-1.json", "utf8"));
@@ -461,50 +506,22 @@ ok "secrets/node-1.json から secretKeyShare を読めた" \
 eq "全サービスのログに secretKeyShare の先頭 16 文字が 0 件" "0" "$(count_all "$SK_PREFIX")"
 
 # ---------------------------------------------------------------------------
-step "10. 誤ったパスワード (ノードは成否を知らない)"
-sign_on alice wrong "itest-bad-$$"
-ok "誤パスワードで CLI が exit 1" "$([ "$SIGN_ON_STATUS" -ne 0 ] && echo 0 || echo 1)"
-ok "id_token が出ていない" "$([ -z "$SIGN_ON_TOKEN" ] && echo 0 || echo 1)"
-has "ブラウザ列に復号失敗の ✖ 行が出ている" "✖ sign-on failed: ct_1 decrypt failed" "$SIGN_ON_STDERR"
-has "「ノードは成否を知らない」が出ている" "nodes cannot tell" "$SIGN_ON_STDERR"
-
-http GET "$GATEWAY/health"
-eq "誤パスワードでも gateway は正常なまま (ノード側はエラーにならない)" 200 "$HTTP_CODE"
-
-# ---------------------------------------------------------------------------
-step "11. DPoP リフレッシュ (--refresh) 後のトークンも JWKS で検証できる"
-REFRESH_NONCE="itest-refresh-$$"
-sign_on alice password123 "$REFRESH_NONCE" --refresh
-ok "npm run sign-on -- --refresh が exit 0" "$SIGN_ON_STATUS"
-REFRESHED_TOKEN="$SIGN_ON_TOKEN"
-ok "リフレッシュ後の id_token が返った" "$([ -n "$REFRESHED_TOKEN" ] && echo 0 || echo 1)"
-ok "リフレッシュ前後でトークンが違う" \
-  "$([ "$REFRESHED_TOKEN" != "$ID_TOKEN" ] && echo 0 || echo 1)"
-has "ブラウザ列に refresh のイベントが出ている" "[browser] refresh   sess=" "$SIGN_ON_STDERR"
-
-printf '%s' "$REFRESHED_TOKEN" > "$WORK/refreshed.txt"
-VERIFY_OUT="$(node "$WORK/verify.mjs" "$WORK/refreshed.txt" "$WORK/jwks.json" \
-  "http://localhost:3000" "demo_client" "$EXPECTED_SUB" "$REFRESH_NONCE")"
-ok "リフレッシュ後の Ed25519 署名が JWKS の鍵で検証できる" "$(verified signature)"
-ok "リフレッシュ後も sub が $EXPECTED_SUB"                "$(verified sub)"
-ok "リフレッシュ後も cnf.jkt がある"                      "$(verified cnf_jkt)"
-ok "リフレッシュ後の exp が未来"                          "$(verified exp_future)"
-
-http POST "$RP/callback" \
-  --data-urlencode "id_token=$REFRESHED_TOKEN" --data-urlencode "state=rp-refresh"
-eq "リフレッシュ後のトークンを rp が受理する" 200 "$HTTP_CODE"
-
-# ---------------------------------------------------------------------------
 step "12. node3 停止 — 2-of-3 で継続できる"
 docker compose stop node3 >/dev/null 2>&1
 EXCLUDE_NONCE="itest-2of3-$$"
 sign_on alice password123 "$EXCLUDE_NONCE"
 ok "node3 停止後もサインオンが成功する" "$SIGN_ON_STATUS"
-ok "id_token が返る" "$([ -n "$SIGN_ON_TOKEN" ] && echo 0 || echo 1)"
+ok "access_token が返る" "$([ -n "$SIGN_ON_TOKEN" ] && echo 0 || echo 1)"
 
+printf '%s' "$SIGN_ON_TOKEN" > "$WORK/token-2of3.txt"
+VERIFY_OUT="$(node "$WORK/verify.mjs" "$WORK/token-2of3.txt" "$WORK/jwks.json" \
+  "$ISSUER" "$CLIENT_ID" "$EXPECTED_SUB")"
+ok "2-of-3 の access_token も JWKS で検証できる" "$(verified signature)"
+
+# nonce は sign-on の 1 行目にしか無い。除外の内訳は 2 行目 (round1) なので -A1 で拾う。
 GW_EXCLUDE="$(logs_of gateway | grep -A1 -- "nonce=$EXCLUDE_NONCE" || true)"
 has "gateway の round1 行に「除外」が出る" "unreachable, excluded" "$GW_EXCLUDE"
-has "除外されたのが node3" "round1 (D,E)×2 (node3 unreachable, excluded)" "$GW_EXCLUDE"
+has "除外されたのが node3" "node3 unreachable, excluded" "$GW_EXCLUDE"
 
 http GET "$GATEWAY/health"
 eq "gateway /health は 200 のまま (閾値を満たす)" 200 "$HTTP_CODE"
@@ -520,7 +537,7 @@ docker compose stop node2 >/dev/null 2>&1
 sign_on alice password123 "itest-1of3-$$"
 ok "node2,3 停止でサインオンが失敗する (exit 1)" \
   "$([ "$SIGN_ON_STATUS" -ne 0 ] && echo 0 || echo 1)"
-ok "id_token は出ない" "$([ -z "$SIGN_ON_TOKEN" ] && echo 0 || echo 1)"
+ok "access_token は出ない" "$([ -z "$SIGN_ON_TOKEN" ] && echo 0 || echo 1)"
 
 http GET "$GATEWAY/health"
 eq "gateway /health が 503" 503 "$HTTP_CODE"
@@ -542,7 +559,7 @@ eq "healthy なノードが 3 件に戻る" "3" \
 
 sign_on alice password123 "itest-recovered-$$"
 ok "gateway を再起動せずにサインオンが成功する" "$SIGN_ON_STATUS"
-ok "id_token が返る" "$([ -n "$SIGN_ON_TOKEN" ] && echo 0 || echo 1)"
+ok "access_token が返る" "$([ -n "$SIGN_ON_TOKEN" ] && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
 step "15. dealer の冪等性 (--if-missing で鍵が変わらない)"
@@ -576,7 +593,7 @@ eq "グループ公開鍵 x が 1 回目と同じ" "$JWKS_X_FIRST" "$(jsonget "$
 
 sign_on alice password123 "itest-restart-$$"
 ok "再起動後もサインオンが成功する" "$SIGN_ON_STATUS"
-ok "id_token が返る" "$([ -n "$SIGN_ON_TOKEN" ] && echo 0 || echo 1)"
+ok "access_token が返る" "$([ -n "$SIGN_ON_TOKEN" ] && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
 echo

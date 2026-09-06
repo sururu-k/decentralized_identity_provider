@@ -283,9 +283,9 @@ OAuth 2.0 の **クライアント (Relying Party)**。認可コードフロー 
 - `gateway`: `depends_on` 各ノード `service_healthy`。`NODE_URLS=http://node1:4001,http://node2:4002,http://node3:4003`。
 - `rp`: `depends_on: gateway: service_healthy`。`IDP_INTERNAL_URL=http://gateway:3000`。
 - 常駐サービスの `HEALTHCHECK` は `--interval=5s --timeout=3s --start-period=3s --retries=3` を **必須** とする (Docker 24 系は `--start-interval` 未対応。`depends_on: service_healthy` の待ち時間はスタック内で最も遅いサービスに律速される)。
-- 総合テスト `scripts/integration-test.sh`: `docker compose up -d --build --wait` 後に、discovery / JWKS 取得、CLI スタンドイン (第 11 節、`projects/demo/cli/sign-on.ts`) で alice の `id_token` 取得、`node:crypto` による外部検証、rp `/callback` への form_post で成功 HTML、`docker compose stop node3` 後にサインオンが依然成功、`stop node2` 後は失敗、を確認する。
+- 総合テスト `scripts/integration-test.sh`: OAuth 認可コードフロー + DPoP (第 14 節) を外側から確認する。`docker compose up -d --build --wait` 後に、discovery (`response_types_supported:["code"]`, `token_endpoint`, `grant_types_supported`, `dpop_signing_alg_values_supported:["EdDSA"]`) / JWKS 取得、CLI スタンドイン (第 11・14 節、`projects/demo/cli/sign-on.ts`) で alice の `access_token` 取得 (authorize→sign-on→code(アサーション)→`/token`)、`node:crypto` による外部検証 (`typ=at+jwt`, `aud=demo_client`, `sub`, `cnf.jkt`, 署名, 改竄拒否)、`refresh_token` grant の `access_token` も同様に検証、**DPoP 束縛** (proof 無しの `/token` は 400 `invalid_dpop_proof`、別の鍵の proof も 400、`OPTIONS /token` の CORS `Access-Control-Allow-Headers` に `DPoP`)、誤パスワードでアサーションが作れず `access_token` に至らない、rp `/` の HTML に `response_type=code` と `dpop_jkt` 組み立て JS、rp `/callback?code&state` が 200、`docker compose stop node3` 後にサインオンが依然成功、`stop node2` 後は失敗、を確認する。
 - 総合テストは冒頭で `node` (**20 以上**) と `npm` の存在を確認し、`projects/demo/node_modules` が無ければ `npm ci --prefix projects/demo` を実行する。ブラウザ役 CLI がブラウザと同じ SDK を Node で走らせるため。
-- 総合テストにデモログ (第 10 節) の検証ステップを置く。固有 nonce でサインオンした後、`docker compose logs --no-log-prefix <svc>` から ANSI を除去して、(a) gateway に `▶ sign-on` 見出しと `受信:`/`計算:`/`非保持:` の 3 行が nonce 付きで出ている、(b) node1..3 に gateway と同じ session id の `▶ sign-on` が出ている、(c) rp に `▶ callback` と `検証 OK` が出ている、(d) 全サービスのログに `password123` が 0 件、(e) `secrets/node-1.json` の `secretKeyShare` の先頭 16 文字がどのログにも無い、(f) node3 停止時に gateway ログへ `到達不能のため除外` が出る、を確認する。
+- 総合テストにデモログ (第 10 節) の検証ステップを置く。固有 nonce でサインオンした後、`docker compose logs --no-log-prefix <svc>` から ANSI を除去して、(a) gateway に今回の nonce の `sign-on` 行 (`user=alice`, `(no pw)`) と `token grant=authz` 行 (合成した `access_token`) が出ている、(b) node1..3 に `sign … grant=authz … assertion σ … ✓` 行が出ている (アサーションと DPoP proof を検証して署名)、(c) 全サービスのログに `password123` が 0 件、(d) `secrets/node-1.json` の `secretKeyShare` の先頭 16 文字がどのログにも無い、(e) node3 停止時に gateway ログへ `(node3 unreachable, excluded)` が出る、を確認する。
 - 並列表示スクリプトは `scripts/demo-tmux.sh` (第 12 節)。
 
 ## 9. レビュー観点 (各コンポーネント 3 ラウンド)
@@ -548,6 +548,7 @@ gateway はいかなるユーザー状態も持たない。authorize セッシ�
   旧 refresh_token の無効化、誤パスワードでアサーションが作れない (code に至らない)、node ログに `sign`、gateway ログに access_token (許容) だが
   パスワード非出力。
 - **廃止**: id_token、`/demo/rp-callback`、`/api/pasta/refresh`、`/authorize/complete`、rs_i/rk_i/ctr、node のセッション記録、rp の form_post 受信・サーバ検証。
+- **削除するファイル**: gateway の `src/client-sdk/client.ts` (id_token 組み立てと削除済み refresh に依存する死にコード)、`src/gateway/session.ts`、`src/demo-callback.ts`。連鎖して未使用になった **凍結コピーも削除する** (`crypto/kdf.ts`, `client-sdk/form-post.ts` — 第 1 節「使わないファイルはコピーしない」を凍結保持より優先)。demo SDK の `src/sdk/crypto/kdf.ts` も同様に削除。残す凍結コピーは実際に import されているものだけ。
 
 ### 14.5 成立する性質
 
