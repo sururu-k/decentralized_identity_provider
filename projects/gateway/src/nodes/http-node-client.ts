@@ -1,18 +1,18 @@
 import {
-  RefreshRequest,
-  RefreshResponse,
   SignOnRequest,
   SignOnResponse,
+  SignRequest,
+  SignResponse,
 } from "../protocol/types.js";
 import { NodeClient } from "./client.js";
 import {
   HealthResponseWire,
   commitResponseFromWire,
   healthResponseFromWire,
-  refreshRequestToWire,
-  refreshResponseFromWire,
   signOnRequestToWire,
   signOnResponseFromWire,
+  signRequestToWire,
+  signResponseFromWire,
 } from "./wire.js";
 
 /** How long the gateway waits on one node call before giving up on it. */
@@ -58,13 +58,22 @@ export class HttpNodeClient implements NodeClient {
     return signOnResponseFromWire(body, `node ${this.nodeId} /sign-on response`);
   }
 
-  public async refresh(
-    roundId: string,
-    req: RefreshRequest,
-    _ownCommitment: { D: Uint8Array; E: Uint8Array }
-  ): Promise<RefreshResponse> {
-    const body = await this.post("/refresh", { roundId, request: refreshRequestToWire(req) });
-    return refreshResponseFromWire(body, `node ${this.nodeId} /refresh response`);
+  public async sign(
+    accessRoundId: string,
+    refreshRoundId: string,
+    req: SignRequest,
+    _accessOwnCommitment: { D: Uint8Array; E: Uint8Array },
+    _refreshOwnCommitment: { D: Uint8Array; E: Uint8Array }
+  ): Promise<SignResponse> {
+    // The node picks its own commitment out of `request.commitments` and
+    // `request.refreshCommitments` by node id (section 5), so the own-commitment
+    // arguments are not sent separately over the wire.
+    const body = await this.post("/sign", {
+      roundId: accessRoundId,
+      refreshRoundId,
+      request: signRequestToWire(req),
+    });
+    return signResponseFromWire(body, `node ${this.nodeId} /sign response`);
   }
 
   /**

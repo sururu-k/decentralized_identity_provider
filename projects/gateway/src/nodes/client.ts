@@ -1,12 +1,7 @@
-import {
-  RefreshRequest,
-  RefreshResponse,
-  SignOnRequest,
-  SignOnResponse,
-} from "../protocol/types.js";
+import { SignOnRequest, SignOnResponse, SignRequest, SignResponse } from "../protocol/types.js";
 
 /**
- * One identity node, as the proxy sees it.
+ * One identity node, as the proxy sees it (`docs/container-split.md` sections 5 and 14).
  *
  * The monolith's `PastaOAuthProxy` held `IdentityNode` objects and called their methods
  * directly. Here a node is a remote HTTP service, so the proxy goes through this
@@ -14,7 +9,8 @@ import {
  * implementation; the tests supply an in-process one over a copied `IdentityNode`.
  *
  * `ownCommitment` is the `{ D, E }` this node returned from `commit(roundId)`. The node
- * needs it back because round 2 signs under the nonce pair it drew in round 1.
+ * needs it back because round 2 signs under the nonce pair it drew in round 1. `/sign`
+ * signs two messages, so it consumes two rounds and two of the node's commitments.
  */
 export interface NodeClient {
   readonly nodeId: number;
@@ -28,9 +24,11 @@ export interface NodeClient {
     ownCommitment: { D: Uint8Array; E: Uint8Array }
   ): Promise<SignOnResponse>;
 
-  refresh(
-    roundId: string,
-    req: RefreshRequest,
-    ownCommitment: { D: Uint8Array; E: Uint8Array }
-  ): Promise<RefreshResponse>;
+  sign(
+    accessRoundId: string,
+    refreshRoundId: string,
+    req: SignRequest,
+    accessOwnCommitment: { D: Uint8Array; E: Uint8Array },
+    refreshOwnCommitment: { D: Uint8Array; E: Uint8Array }
+  ): Promise<SignResponse>;
 }

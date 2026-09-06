@@ -4,7 +4,9 @@ import { createDemoLog, type DemoLog } from "../../src/demolog.js";
 import { PastaOAuthProxy } from "../../src/gateway/proxy.js";
 import { discoverNodes } from "../../src/nodes/discovery.js";
 import { createGatewayServer } from "../../src/server.js";
-import { hexToBytes, readFixtureJson } from "./fake-node.js";
+import { TEST_ISSUER, hexToBytes, readFixtureJson } from "./fake-node.js";
+
+export { TEST_ISSUER };
 
 /**
  * Starts a real gateway server on an ephemeral port, wired to real node URLs.
@@ -20,11 +22,10 @@ import { hexToBytes, readFixtureJson } from "./fake-node.js";
  * the suite runs in a terminal or in CI. Colour itself is covered by `demolog.test.ts`.
  */
 
-export const TEST_ISSUER = "https://idp.test";
-
 export interface RunningGateway {
   url: string;
   issuer: string;
+  rpOrigin: string;
   server: http.Server;
   proxy: PastaOAuthProxy;
   close(): Promise<void>;
@@ -35,6 +36,7 @@ export interface StartGatewayOptions {
   threshold?: number;
   demoDist?: string;
   issuer?: string;
+  rpOrigin?: string;
   demoLog?: DemoLog;
 }
 
@@ -43,6 +45,7 @@ export async function startGateway(options: StartGatewayOptions): Promise<Runnin
   const groupPublicKey = hexToBytes(group.groupPublicKey);
   const threshold = options.threshold ?? group.threshold;
   const issuer = options.issuer ?? TEST_ISSUER;
+  const rpOrigin = options.rpOrigin ?? "http://localhost:3001";
 
   const nodes = await discoverNodes({
     urls: options.nodeUrls,
@@ -53,7 +56,7 @@ export async function startGateway(options: StartGatewayOptions): Promise<Runnin
   });
 
   const demoLog = options.demoLog ?? createDemoLog({ env: {}, isTty: false });
-  const proxy = new PastaOAuthProxy(nodes, threshold, undefined, demoLog);
+  const proxy = new PastaOAuthProxy(nodes, threshold, demoLog, issuer, group.keyId);
   const server = createGatewayServer({
     issuer,
     threshold,
@@ -62,6 +65,7 @@ export async function startGateway(options: StartGatewayOptions): Promise<Runnin
     proxy,
     nodes,
     demoDist: options.demoDist ?? "/nonexistent-demo-dist",
+    rpOrigin,
     demoLog,
   });
 
@@ -78,6 +82,7 @@ export async function startGateway(options: StartGatewayOptions): Promise<Runnin
   return {
     url: `http://127.0.0.1:${port}`,
     issuer,
+    rpOrigin,
     server,
     proxy,
     close: () =>
@@ -128,6 +133,27 @@ export async function postForm(
     await fetch(`${url}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(fields).toString(),
+    })
+  );
+}
+
+/** `POST /token`: form body plus an optional `DPoP` proof header (section 14). */
+export async function postToken(
+  url: string,
+  fields: Record<string, string>,
+  dpopProof?: string
+): Promise<JsonResponse> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/x-www-form-urlencoded",
+  };
+  if (dpopProof !== undefined) {
+    headers["DPoP"] = dpopProof;
+  }
+  return readResponse(
+    await fetch(`${url}/token`, {
+      method: "POST",
+      headers,
       body: new URLSearchParams(fields).toString(),
     })
   );

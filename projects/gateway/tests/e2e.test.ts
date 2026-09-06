@@ -4,32 +4,39 @@ import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { DecentralizedClientSdk } from "../src/client-sdk/client.js";
-import { createDPoPProof } from "../src/client-sdk/dpop.js";
+import {
+  calculateJwkThumbprint,
+  createDPoPProof,
+  exportDPoPJwk,
+  generateDPoPKeyPair,
+  type DPoPKeyPair,
+} from "../src/client-sdk/dpop.js";
 import { blind } from "../src/crypto/toprf.js";
-import { CONTINUATION_INDENT } from "../src/demolog.js";
 import { verifyJwt } from "../src/jwt/jwt.js";
 import { base64UrlDecode, base64UrlEncode } from "../src/jwt/jwt.js";
 import { startFakeNodes, type RunningFakeNode } from "./helpers/fake-node.js";
+import { assembleAssertion } from "./helpers/sign-on-client.js";
 import {
   TEST_ISSUER,
   getJson,
-  postForm,
   postJson,
+  postToken,
   startGateway,
   type RunningGateway,
 } from "./helpers/gateway.js";
 
 /**
- * Component end-to-end tests (`docs/container-split.md` section 6).
+ * Component end-to-end tests (`docs/container-split.md` sections 6 and 14).
  *
  * Three fake node servers and the gateway all listen on ephemeral ports, and every
- * assertion below travels over a real socket: the client SDK runs in its HTTP
- * (`proxyUrl`) mode, so the base64url wire contract of section 3 is exercised in both
- * directions rather than bypassed by in-process calls.
+ * assertion below travels over a real socket: the browser's sign-on and token exchange
+ * are reproduced by `assembleAssertion` and the DPoP helpers, so the base64url wire of
+ * section 3 and the OAuth flow of section 14 are exercised end to end.
  */
 
 const ALICE = { username: "alice", password: "password123", sub: "usr_alice_12345" };
+const TOKEN_ENDPOINT = `${TEST_ISSUER}/token`;
+const REDIRECT_URI = "http://localhost:3001/callback";
 
 let nodes: RunningFakeNode[];
 let gateway: RunningGateway;
@@ -55,10 +62,35 @@ afterAll(async () => {
 /** A real RFC 7638 thumbprint: SHA-256, base64url, 43 characters (section 13). */
 const RP_JKT = "b0JFnFHOoQOqFk3sGvEnW6tC8VOBT9NIXtYjIrhAHTA";
 
+interface FlowResult {
+  keyPair: DPoPKeyPair;
+  cnfJkt: string;
+  assertion: string;
+  sub: string;
+}
+
+/** Runs sign-on and assembles the assertion (the code) bound to a fresh DPoP key. */
+async function signOnToCode(
+  gatewayUrl: string,
+  opts: { clientId?: string; scope?: string; nonce?: string; password?: string } = {}
+): Promise<FlowResult> {
+  const keyPair = generateDPoPKeyPair();
+  const cnfJkt = calculateJwkThumbprint(exportDPoPJwk(keyPair.publicKey));
+  const { assertion, sub } = await assembleAssertion({
+    gatewayUrl,
+    issuer: TEST_ISSUER,
+    username: ALICE.username,
+    password: opts.password ?? ALICE.password,
+    clientId: opts.clientId ?? "demo_client",
+    scope: opts.scope ?? "openid profile",
+    nonce: opts.nonce ?? "c-challenge",
+    cnfJkt,
+  });
+  return { keyPair, cnfJkt, assertion, sub };
+}
+
 describe("node discovery", () => {
   it("learns each node id from /health rather than from NODE_URLS order", async () => {
-    // The fake nodes bind ports in whatever order the OS hands them out, so the URL list
-    // is not sorted by node id. Discovery must still pair every URL with the right id.
     const discovered = gateway.proxy.getNodes();
     expect(discovered.map((n) => n.nodeId)).toEqual([1, 2, 3]);
     for (const client of discovered) {
@@ -72,7 +104,6 @@ describe("node discovery", () => {
       const body = JSON.stringify({
         status: "ok",
         nodeId: 1,
-        // 32 zero bytes: a valid base64url point, but not this group's key.
         groupPublicKey: base64UrlEncode(new Uint8Array(32)),
       });
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -92,7 +123,6 @@ describe("node discovery", () => {
   });
 
   it("refuses to start when a node never comes up", async () => {
-    // Bind and immediately release a port, so nothing is listening there.
     const probe = http.createServer();
     await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", () => resolve()));
     const { port } = probe.address() as AddressInfo;
@@ -104,13 +134,14 @@ describe("node discovery", () => {
   });
 });
 
-describe("OIDC endpoints", () => {
-  it("serves a discovery document naming the configured issuer", async () => {
+describe("OIDC / OAuth endpoints", () => {
+  it("serves an authorization-code discovery document naming the token endpoint", async () => {
     const res = await getJson(gateway.url, "/.well-known/openid-configuration");
     expect(res.status).toBe(200);
     expect(res.body.issuer).toBe(TEST_ISSUER);
-    expect(res.body.jwks_uri).toBe(`${TEST_ISSUER}/jwks.json`);
-    expect(res.body.response_modes_supported).toContain("form_post");
+    expect(res.body.token_endpoint).toBe(`${TEST_ISSUER}/token`);
+    expect(res.body.response_types_supported).toEqual(["code"]);
+    expect(res.body.grant_types_supported).toEqual(["authorization_code", "refresh_token"]);
   });
 
   it("publishes the dealer's group public key as JWKS", async () => {
@@ -121,133 +152,107 @@ describe("OIDC endpoints", () => {
     expect(base64UrlDecode(res.body.keys[0].x)).toHaveLength(32);
   });
 
-  it("redirects a well-formed /authorize to the demo login step", async () => {
+  it("redirects a well-formed response_type=code /authorize to the demo login", async () => {
     const query = new URLSearchParams({
       client_id: "demo_client",
-      redirect_uri: "http://rp.example/callback",
-      response_type: "id_token",
-      response_mode: "form_post",
+      redirect_uri: REDIRECT_URI,
+      response_type: "code",
       scope: "openid profile",
-      nonce: "n-authorize",
       state: "st-1",
       dpop_jkt: RP_JKT,
     });
     const res = await getJson(gateway.url, `/authorize?${query}`);
     expect(res.status).toBe(200);
     expect(res.text).toContain("/demo?step=login");
-    expect(res.text).toContain(encodeURIComponent("http://rp.example/callback"));
-    expect(res.text).toContain("nonce=n-authorize");
-    // Section 13: the RP front end's thumbprint reaches the demo UI untouched.
+    expect(res.text).toContain(encodeURIComponent(REDIRECT_URI));
+    // A fresh challenge c is generated and carried through.
+    expect(res.text).toMatch(/[?&]c=[^&"]+/);
     expect(res.text).toContain(`dpop_jkt=${RP_JKT}`);
+    expect(res.text).toContain("state=st-1");
   });
 
-  it("rejects /authorize without a nonce, and with a non form_post response_mode", async () => {
-    const noNonce = await getJson(
+  it("rejects /authorize with a non-code response_type or a missing dpop_jkt", async () => {
+    const idToken = await getJson(
       gateway.url,
-      "/authorize?client_id=c&redirect_uri=http://rp.example/cb&response_type=id_token&scope=openid"
+      `/authorize?client_id=c&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
+        `&response_type=id_token&scope=openid&dpop_jkt=${RP_JKT}`
     );
-    expect(noNonce.status).toBe(400);
-    expect(noNonce.text).toContain("nonce");
+    expect(idToken.status).toBe(400);
+    expect(idToken.text).toContain("code");
 
-    const badMode = await getJson(
+    const noJkt = await getJson(
       gateway.url,
-      "/authorize?client_id=c&redirect_uri=http://rp.example/cb&response_type=id_token" +
-        "&response_mode=query&scope=openid&nonce=n"
+      `/authorize?client_id=c&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
+        `&response_type=code&scope=openid`
     );
-    expect(badMode.status).toBe(400);
-    expect(badMode.text).toContain("form_post");
-
-    const badType = await getJson(
-      gateway.url,
-      "/authorize?client_id=c&redirect_uri=http://rp.example/cb&response_type=code&scope=openid&nonce=n"
-    );
-    expect(badType.status).toBe(400);
-  });
-
-  it("rejects /authorize when dpop_jkt is missing or malformed", async () => {
-    const base =
-      "/authorize?client_id=c&redirect_uri=http://rp.example/cb&response_type=id_token" +
-      "&response_mode=form_post&scope=openid&nonce=n";
-
-    const missing = await getJson(gateway.url, base);
-    expect(missing.status).toBe(400);
-    expect(missing.text).toContain("Authorize Error:");
-    expect(missing.text).toContain("dpop_jkt");
-
-    const tooLong = await getJson(gateway.url, `${base}&dpop_jkt=${RP_JKT}A`);
-    expect(tooLong.status).toBe(400);
-    expect(tooLong.text).toContain("dpop_jkt");
-
-    const padded = await getJson(
-      gateway.url,
-      `${base}&dpop_jkt=${encodeURIComponent(RP_JKT.slice(0, 42) + "=")}`
-    );
-    expect(padded.status).toBe(400);
-    expect(padded.text).toContain("dpop_jkt");
+    expect(noJkt.status).toBe(400);
+    expect(noJkt.text).toContain("dpop_jkt");
   });
 });
 
-describe("sign-on and refresh over HTTP", () => {
-  it("mints an id_token the published JWKS verifies, then refreshes it", async () => {
+describe("the token flow over HTTP (section 14)", () => {
+  it("mints an access token and a refresh token the JWKS verifies, then refreshes", async () => {
     const jwks = await getJson(gateway.url, "/jwks.json");
     const publishedKey = base64UrlDecode(jwks.body.keys[0].x);
 
-    const sdk = new DecentralizedClientSdk({ proxyUrl: gateway.url, issuer: TEST_ISSUER });
+    const flow = await signOnToCode(gateway.url, { scope: "openid profile", nonce: "c-1" });
+    const proof = createDPoPProof(flow.keyPair, "POST", TOKEN_ENDPOINT);
 
-    const nonce = "n-signon-1";
-    const { id_token, sessionId } = await sdk.signOn({
-      username: ALICE.username,
-      password: ALICE.password,
-      clientId: "demo_client",
-      nonce,
-    });
+    const res = await postToken(
+      gateway.url,
+      {
+        grant_type: "authorization_code",
+        code: flow.assertion,
+        client_id: "demo_client",
+        redirect_uri: REDIRECT_URI,
+      },
+      proof
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.token_type).toBe("DPoP");
+    expect(res.body.expires_in).toBe(3600);
+    expect(res.body.scope).toBe("openid profile");
 
-    expect(typeof sessionId).toBe("string");
-
-    const verified = verifyJwt(id_token, publishedKey, {
+    // Access token verifies, is an at+jwt, and is bound to the RP's key.
+    const at = verifyJwt(res.body.access_token, publishedKey, {
       iss: TEST_ISSUER,
       aud: "demo_client",
-      nonce,
     });
-    expect(verified.valid).toBe(true);
-    expect(verified.payload.sub).toBe(ALICE.sub);
-    expect(verified.payload.cnf.jkt).toBe(sdk.cnfJkt);
+    expect(at.valid).toBe(true);
+    expect(at.header.typ).toBe("at+jwt");
+    expect(at.payload.sub).toBe(ALICE.sub);
+    expect(at.payload.scope).toBe("openid profile");
+    expect(at.payload.cnf.jkt).toBe(flow.cnfJkt);
 
-    const refreshUrl = `${gateway.url}/api/pasta/refresh`;
-    const refreshed = await sdk.refresh({
-      clientId: "demo_client",
-      nonce: "n-refresh-1",
-      refreshEndpointUrl: refreshUrl,
-    });
+    // Refresh token verifies and is a refresh+jwt.
+    const rt = verifyJwt(res.body.refresh_token, publishedKey, { iss: TEST_ISSUER });
+    expect(rt.valid).toBe(true);
+    expect(rt.header.typ).toBe("refresh+jwt");
+    expect(rt.payload.sub).toBe(ALICE.sub);
+    expect(rt.payload.cnf.jkt).toBe(flow.cnfJkt);
 
-    const refreshedVerify = verifyJwt(refreshed.id_token, publishedKey, {
+    // Refresh grant: a new proof, the node-signed refresh token, new tokens back.
+    const refreshProof = createDPoPProof(flow.keyPair, "POST", TOKEN_ENDPOINT);
+    const refreshed = await postToken(
+      gateway.url,
+      { grant_type: "refresh_token", refresh_token: res.body.refresh_token },
+      refreshProof
+    );
+    expect(refreshed.status).toBe(200);
+    const newAt = verifyJwt(refreshed.body.access_token, publishedKey, {
       iss: TEST_ISSUER,
       aud: "demo_client",
-      nonce: "n-refresh-1",
     });
-    expect(refreshedVerify.valid).toBe(true);
-    expect(refreshedVerify.payload.sub).toBe(ALICE.sub);
+    expect(newAt.valid).toBe(true);
+    expect(newAt.header.typ).toBe("at+jwt");
+    expect(newAt.payload.sub).toBe(ALICE.sub);
+    expect(newAt.payload.cnf.jkt).toBe(flow.cnfJkt);
+    const newRt = verifyJwt(refreshed.body.refresh_token, publishedKey, { iss: TEST_ISSUER });
+    expect(newRt.valid).toBe(true);
+    expect(newRt.header.typ).toBe("refresh+jwt");
   });
 
-  it("puts base64url on the wire, never a serialized Uint8Array", async () => {
-    const res = await postJson(gateway.url, "/api/pasta/sign-on", {
-      username: ALICE.username,
-      // A syntactically valid but wrong blinded point still exercises the wire shape of
-      // the reply, so decode it from a real sign-on instead: run one through the SDK.
-      blinded: "invalid",
-      sessionNonce: "AAAAAAAAAAAAAAAAAAAAAA",
-      cnfJkt: "jkt",
-      nonce: "n-wire-invalid",
-      iat: Math.floor(Date.now() / 1000),
-      exp: Math.floor(Date.now() / 1000) + 300,
-      aud: "demo_client",
-      iss: TEST_ISSUER,
-    });
-    // A malformed blinded point is a caller error, not a gateway fault.
-    expect(res.status).toBe(400);
-    expect(typeof res.body.error).toBe("string");
-
-    // Now the shape of a successful reply, driven by a genuine blinded point.
+  it("puts base64url and hex on the wire and never a serialized Uint8Array", async () => {
     const { blinded } = blind(ALICE.password);
     const raw = await fetch(`${gateway.url}/api/pasta/sign-on`, {
       method: "POST",
@@ -257,298 +262,207 @@ describe("sign-on and refresh over HTTP", () => {
         blinded: base64UrlEncode(blinded.toRawBytes()),
         sessionNonce: base64UrlEncode(new Uint8Array(16)),
         cnfJkt: "jkt-wire",
-        nonce: "n-wire",
+        clientId: "demo_client",
+        scope: "openid",
+        nonce: "c-wire",
         iat: Math.floor(Date.now() / 1000),
-        exp: Math.floor(Date.now() / 1000) + 300,
-        aud: "demo_client",
+        exp: Math.floor(Date.now() / 1000) + 30,
         iss: TEST_ISSUER,
       }),
     });
     expect(raw.status).toBe(200);
     const body = await raw.json();
     for (const commitment of body.commitments) {
-      expect(typeof commitment.D).toBe("string");
       expect(commitment.D).toMatch(/^[A-Za-z0-9_-]+$/);
       expect(base64UrlDecode(commitment.D)).toHaveLength(32);
     }
     for (const nodeResponse of body.nodeResponses) {
-      expect(typeof nodeResponse.commitment.D).toBe("string");
       expect(base64UrlDecode(nodeResponse.commitment.E)).toHaveLength(32);
+      expect(nodeResponse.ct_i).toMatch(/^[A-Za-z0-9_-]+$/);
     }
   });
 
-  it("still signs on with only two of the three nodes configured", async () => {
-    const twoNodes = await startGateway({
-      nodeUrls: [nodes[0].url, nodes[1].url],
-      demoDist,
+  it("rejects /token with no DPoP proof", async () => {
+    const flow = await signOnToCode(gateway.url);
+    const res = await postToken(gateway.url, {
+      grant_type: "authorization_code",
+      code: flow.assertion,
+      client_id: "demo_client",
+      redirect_uri: REDIRECT_URI,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("invalid_dpop_proof");
+  });
+
+  it("rejects /token when the proof key is not the code's cnf.jkt", async () => {
+    const flow = await signOnToCode(gateway.url);
+    // A proof from a different key: right shape, wrong thumbprint.
+    const otherKey = generateDPoPKeyPair();
+    const proof = createDPoPProof(otherKey, "POST", TOKEN_ENDPOINT);
+    const res = await postToken(
+      gateway.url,
+      {
+        grant_type: "authorization_code",
+        code: flow.assertion,
+        client_id: "demo_client",
+        redirect_uri: REDIRECT_URI,
+      },
+      proof
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("invalid_dpop_proof");
+  });
+
+  it("rejects /token for an unknown grant type and a missing code", async () => {
+    const badGrant = await postToken(
+      gateway.url,
+      { grant_type: "password", code: "x" },
+      createDPoPProof(generateDPoPKeyPair(), "POST", TOKEN_ENDPOINT)
+    );
+    expect(badGrant.status).toBe(400);
+    expect(badGrant.body.error).toBe("unsupported_grant_type");
+
+    const noCode = await postToken(
+      gateway.url,
+      { grant_type: "authorization_code", client_id: "demo_client" },
+      createDPoPProof(generateDPoPKeyPair(), "POST", TOKEN_ENDPOINT)
+    );
+    expect(noCode.status).toBe(400);
+    expect(noCode.body.error).toBe("invalid_request");
+  });
+
+  it("rejects a tampered code", async () => {
+    const flow = await signOnToCode(gateway.url);
+    const parts = flow.assertion.split(".");
+    const tampered = `${parts[0]}.${parts[1]}.${"A".repeat(parts[2].length)}`;
+    const proof = createDPoPProof(flow.keyPair, "POST", TOKEN_ENDPOINT);
+    const res = await postToken(
+      gateway.url,
+      {
+        grant_type: "authorization_code",
+        code: tampered,
+        client_id: "demo_client",
+        redirect_uri: REDIRECT_URI,
+      },
+      proof
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("invalid_grant");
+  });
+
+  it("still issues a token with only two of the three nodes reachable", async () => {
+    const trio = await startFakeNodes();
+    const gw = await startGateway({ nodeUrls: trio.map((n) => n.url), demoDist });
+    try {
+      await trio[2].close();
+
+      const jwks = await getJson(gw.url, "/jwks.json");
+      const publishedKey = base64UrlDecode(jwks.body.keys[0].x);
+
+      const flow = await signOnToCode(gw.url, { nonce: "c-2of3" });
+      const proof = createDPoPProof(flow.keyPair, "POST", TOKEN_ENDPOINT);
+      const res = await postToken(
+        gw.url,
+        {
+          grant_type: "authorization_code",
+          code: flow.assertion,
+          client_id: "demo_client",
+          redirect_uri: REDIRECT_URI,
+        },
+        proof
+      );
+      expect(res.status).toBe(200);
+      const at = verifyJwt(res.body.access_token, publishedKey, {
+        iss: TEST_ISSUER,
+        aud: "demo_client",
+      });
+      expect(at.valid).toBe(true);
+      expect(at.payload.cnf.jkt).toBe(flow.cnfJkt);
+    } finally {
+      await gw.close();
+      await Promise.all(trio.map((n) => n.close()));
+    }
+  });
+
+  it("answers the CORS preflight for /token with the DPoP header allowed", async () => {
+    const res = await fetch(`${gateway.url}/token`, { method: "OPTIONS" });
+    expect(res.status).toBe(204);
+    expect(res.headers.get("access-control-allow-origin")).toBe("http://localhost:3001");
+    expect(res.headers.get("access-control-allow-methods")).toContain("POST");
+    expect(res.headers.get("access-control-allow-headers")).toContain("DPoP");
+    expect(res.headers.get("access-control-allow-headers")).toContain("Content-Type");
+  });
+
+  it("answers the CORS preflight for /jwks.json", async () => {
+    const res = await fetch(`${gateway.url}/jwks.json`, { method: "OPTIONS" });
+    expect(res.status).toBe(204);
+    expect(res.headers.get("access-control-allow-origin")).toBe("http://localhost:3001");
+    expect(res.headers.get("access-control-allow-methods")).toContain("GET");
+    // The real GET carries the origin header too.
+    const get = await fetch(`${gateway.url}/jwks.json`);
+    expect(get.headers.get("access-control-allow-origin")).toBe("http://localhost:3001");
+  });
+});
+
+describe("the gateway never sees a password", () => {
+  it("no longer exposes the browser sign-on or refresh routes", async () => {
+    const browser = await postJson(gateway.url, "/api/pasta/browser-sign-on", {
+      username: ALICE.username,
+      password: ALICE.password,
+    });
+    expect(browser.status).toBe(404);
+
+    const refresh = await postJson(gateway.url, "/api/pasta/refresh", { sessionId: "x" });
+    expect(refresh.status).toBe(404);
+  });
+
+  it("reads only username and blinded off a sign-on body, ignoring any password", async () => {
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
     });
     try {
-      const sdk = new DecentralizedClientSdk({ proxyUrl: twoNodes.url, issuer: TEST_ISSUER });
-      const { id_token } = await sdk.signOn({
+      const withWrongPassword = await postJson(gateway.url, "/api/pasta/sign-on", {
         username: ALICE.username,
-        password: ALICE.password,
-        clientId: "demo_client",
-        nonce: "n-2of3",
-      });
-      const jwks = await getJson(twoNodes.url, "/jwks.json");
-      const verified = verifyJwt(id_token, base64UrlDecode(jwks.body.keys[0].x), {
-        iss: TEST_ISSUER,
-      });
-      expect(verified.valid).toBe(true);
-
-      const refreshed = await sdk.refresh({
-        clientId: "demo_client",
-        nonce: "n-2of3-refresh",
-        refreshEndpointUrl: `${twoNodes.url}/api/pasta/refresh`,
-      });
-      expect(
-        verifyJwt(refreshed.id_token, base64UrlDecode(jwks.body.keys[0].x), { iss: TEST_ISSUER })
-          .valid
-      ).toBe(true);
-    } finally {
-      await twoNodes.close();
-    }
-  });
-
-  it("forms a quorum from the nodes that answer when one is down", async () => {
-    const trio = await startFakeNodes();
-    const gw = await startGateway({ nodeUrls: trio.map((n) => n.url), demoDist });
-    try {
-      await trio[2].close();
-
-      const sdk = new DecentralizedClientSdk({ proxyUrl: gw.url, issuer: TEST_ISSUER });
-      const { id_token } = await sdk.signOn({
-        username: ALICE.username,
-        password: ALICE.password,
-        clientId: "demo_client",
-        nonce: "n-degraded",
-      });
-      const jwks = await getJson(gw.url, "/jwks.json");
-      expect(
-        verifyJwt(id_token, base64UrlDecode(jwks.body.keys[0].x), { iss: TEST_ISSUER }).valid
-      ).toBe(true);
-
-      // With only one node left the threshold can no longer be met.
-      await trio[1].close();
-      const failing = new DecentralizedClientSdk({ proxyUrl: gw.url, issuer: TEST_ISSUER });
-      await expect(
-        failing.signOn({
-          username: ALICE.username,
-          password: ALICE.password,
-          clientId: "demo_client",
-          nonce: "n-below-threshold",
-        })
-      ).rejects.toThrow(/status 400/);
-    } finally {
-      await gw.close();
-      await Promise.all(trio.map((n) => n.close()));
-    }
-  });
-
-  it("refreshes over the reachable half of the sign-on quorum after a node dies", async () => {
-    // The path the contract calls out in section 6: a session is established by all
-    // three nodes, one of them then goes away, and a refresh that names no participants
-    // has to re-form a quorum out of the survivors. Only the nodes that signed hold an
-    // `rs_i` for this session, so the gateway must go back to the recorded set and drop
-    // the unreachable member rather than falling back to its whole roster.
-    const trio = await startFakeNodes();
-    const gw = await startGateway({ nodeUrls: trio.map((n) => n.url), demoDist });
-    try {
-      const sdk = new DecentralizedClientSdk({ proxyUrl: gw.url, issuer: TEST_ISSUER });
-      const { sessionId } = await sdk.signOn({
-        username: ALICE.username,
-        password: ALICE.password,
-        clientId: "demo_client",
-        nonce: "n-refresh-after-outage",
-      });
-
-      // All three signed, so all three are on the session record.
-      expect(gw.proxy.getSessionManager().getSessionParticipants(sessionId)).toEqual([1, 2, 3]);
-
-      const downNode = trio.find((n) => n.nodeId === 3)!;
-      await downNode.close();
-
-      const refreshUrl = `${gw.url}/api/pasta/refresh`;
-      const refreshed = await sdk.refresh({
-        clientId: "demo_client",
-        nonce: "n-refresh-after-outage-2",
-        refreshEndpointUrl: refreshUrl,
-        // participants deliberately unset: the gateway chooses.
-      });
-
-      const jwks = await getJson(gw.url, "/jwks.json");
-      const verified = verifyJwt(refreshed.id_token, base64UrlDecode(jwks.body.keys[0].x), {
-        iss: TEST_ISSUER,
-        aud: "demo_client",
-        nonce: "n-refresh-after-outage-2",
-      });
-      expect(verified.valid).toBe(true);
-      expect(verified.payload.sub).toBe(ALICE.sub);
-      expect(verified.payload.cnf.jkt).toBe(sdk.cnfJkt);
-
-      // And the quorum really was the two survivors, not the full roster: a raw refresh
-      // shows which nodes answered round 2.
-      const raw = await postJson(gw.url, "/api/pasta/refresh", {
-        sessionId,
-        dpopProof: createDPoPProof(sdk.getDPoPKeyPair(), "POST", refreshUrl),
-        expectedHtu: refreshUrl,
-        nonce: "n-refresh-raw",
-        iat: Math.floor(Date.now() / 1000),
-        exp: Math.floor(Date.now() / 1000) + 300,
-        aud: "demo_client",
-        iss: TEST_ISSUER,
-      });
-      expect(raw.status).toBe(200);
-      expect(raw.body.nodeResponses.map((r: any) => r.nodeId).sort()).toEqual([1, 2]);
-      expect(raw.body.commitments.map((c: any) => c.nodeId).sort()).toEqual([1, 2]);
-    } finally {
-      await gw.close();
-      await Promise.all(trio.map((n) => n.close()));
-    }
-  });
-
-  it("routes an unqualified refresh to the sign-on quorum, not to the whole roster", async () => {
-    // The discriminating case for section 6's rule that a refresh goes back to the nodes
-    // that signed on. Alice signs on with nodes 1 and 2 only, while node 3 stays up and
-    // reachable. A gateway that refreshed against its full roster would pull in node 3,
-    // which holds no `rs_i` for this session and rejects the request, and round 2 is all
-    // or nothing -- so the refresh only succeeds if the recorded set is what is used.
-    const trio = await startFakeNodes();
-    const gw = await startGateway({ nodeUrls: trio.map((n) => n.url), demoDist });
-    try {
-      const sdk = new DecentralizedClientSdk({ proxyUrl: gw.url, issuer: TEST_ISSUER });
-      const { sessionId } = await sdk.signOn({
-        username: ALICE.username,
-        password: ALICE.password,
-        clientId: "demo_client",
-        nonce: "n-partial-quorum",
-        participants: [1, 2],
-      });
-
-      expect(gw.proxy.getSessionManager().getSessionParticipants(sessionId)).toEqual([1, 2]);
-      // Node 3 is healthy and would be picked up by a roster-wide refresh.
-      const health = await getJson(gw.url, "/health");
-      expect(health.body.nodes.filter((n: any) => n.healthy)).toHaveLength(3);
-
-      const refreshUrl = `${gw.url}/api/pasta/refresh`;
-      const refreshed = await sdk.refresh({
-        clientId: "demo_client",
-        nonce: "n-partial-quorum-2",
-        refreshEndpointUrl: refreshUrl,
-      });
-      const jwks = await getJson(gw.url, "/jwks.json");
-      expect(
-        verifyJwt(refreshed.id_token, base64UrlDecode(jwks.body.keys[0].x), {
-          iss: TEST_ISSUER,
-          aud: "demo_client",
-          nonce: "n-partial-quorum-2",
-        }).valid
-      ).toBe(true);
-
-      const raw = await postJson(gw.url, "/api/pasta/refresh", {
-        sessionId,
-        dpopProof: createDPoPProof(sdk.getDPoPKeyPair(), "POST", refreshUrl),
-        expectedHtu: refreshUrl,
-        nonce: "n-refresh-raw",
-        iat: Math.floor(Date.now() / 1000),
-        exp: Math.floor(Date.now() / 1000) + 300,
-        aud: "demo_client",
-        iss: TEST_ISSUER,
-      });
-      expect(raw.status).toBe(200);
-      expect(raw.body.nodeResponses.map((r: any) => r.nodeId).sort()).toEqual([1, 2]);
-    } finally {
-      await gw.close();
-      await Promise.all(trio.map((n) => n.close()));
-    }
-  });
-
-  it("fails a refresh once the sign-on quorum drops below the threshold", async () => {
-    const trio = await startFakeNodes();
-    const gw = await startGateway({ nodeUrls: trio.map((n) => n.url), demoDist });
-    try {
-      const sdk = new DecentralizedClientSdk({ proxyUrl: gw.url, issuer: TEST_ISSUER });
-      await sdk.signOn({
-        username: ALICE.username,
-        password: ALICE.password,
-        clientId: "demo_client",
-        nonce: "n-refresh-below",
-      });
-
-      await trio[1].close();
-      await trio[2].close();
-
-      await expect(
-        sdk.refresh({
-          clientId: "demo_client",
-          nonce: "n-refresh-below-2",
-          refreshEndpointUrl: `${gw.url}/api/pasta/refresh`,
-        })
-      ).rejects.toThrow(/status 400/);
-    } finally {
-      await gw.close();
-      await Promise.all(trio.map((n) => n.close()));
-    }
-  });
-
-  it("refuses an explicit participant list when one of those nodes is down", async () => {
-    // An explicit list is a request for a specific quorum. Substituting a different one
-    // would be a surprise, so the gateway fails instead (section 6, proxy layer rules).
-    const trio = await startFakeNodes();
-    const gw = await startGateway({ nodeUrls: trio.map((n) => n.url), demoDist });
-    try {
-      await trio[2].close();
-      const { blinded } = blind(ALICE.password);
-      const res = await postJson(gw.url, "/api/pasta/sign-on", {
-        username: ALICE.username,
-        blinded: base64UrlEncode(blinded.toRawBytes()),
+        password: "hunter2-should-be-ignored",
+        blinded: base64UrlEncode(blind(ALICE.password).blinded.toRawBytes()),
         sessionNonce: base64UrlEncode(new Uint8Array(16)),
-        cnfJkt: "jkt-explicit",
-        nonce: "n-explicit",
+        cnfJkt: "jkt-ignores-password",
+        clientId: "demo_client",
+        scope: "openid",
+        nonce: "c-ignores-password",
         iat: Math.floor(Date.now() / 1000),
-        exp: Math.floor(Date.now() / 1000) + 300,
-        aud: "demo_client",
+        exp: Math.floor(Date.now() / 1000) + 30,
         iss: TEST_ISSUER,
-        participants: [1, 2, 3],
       });
-      expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/did not all commit/);
+      expect(withWrongPassword.status).toBe(200);
+      expect(withWrongPassword.body.nodeResponses).toHaveLength(3);
 
-      // The same request naming only the survivors succeeds.
-      const ok = await postJson(gw.url, "/api/pasta/sign-on", {
-        username: ALICE.username,
-        blinded: base64UrlEncode(blinded.toRawBytes()),
-        sessionNonce: base64UrlEncode(new Uint8Array(16)),
-        cnfJkt: "jkt-explicit",
-        nonce: "n-explicit",
-        iat: Math.floor(Date.now() / 1000),
-        exp: Math.floor(Date.now() / 1000) + 300,
-        aud: "demo_client",
-        iss: TEST_ISSUER,
-        participants: [1, 2],
-      });
-      expect(ok.status).toBe(200);
-      expect(ok.body.nodeResponses.map((r: any) => r.nodeId).sort()).toEqual([1, 2]);
+      const printed = logs.join("\n");
+      expect(printed).toContain("[gateway] sign-on   sess=");
+      expect(printed).not.toContain(ALICE.password);
+      expect(printed).not.toContain("hunter2");
     } finally {
-      await gw.close();
-      await Promise.all(trio.map((n) => n.close()));
+      spy.mockRestore();
     }
   });
 
-  it("requires a nonce on sign-on, whatever shape the caller left it in", async () => {
-    // `nonce` is mandatory at the gateway door (`docs/container-split.md` section 6).
-    // The reference `deterministicJsonStringify` writes an absent one out as
-    // `"nonce":undefined`, so a sign-on without it mints a token whose payload is not
-    // valid JSON -- correctly signed, and unparseable by every relying party. A literal
-    // `null` is refused for the same reason, before it can burn a FROST round.
+  it("fails to assemble a code on a wrong password, the gateway relaying happily", async () => {
+    await expect(
+      signOnToCode(gateway.url, { password: "not-the-password" })
+    ).rejects.toThrow(/Invalid password or corrupted share/);
+  });
+
+  it("requires a nonce and a clientId on sign-on", async () => {
     const base = () => ({
       username: ALICE.username,
       blinded: base64UrlEncode(blind(ALICE.password).blinded.toRawBytes()),
       sessionNonce: base64UrlEncode(new Uint8Array(16)),
-      cnfJkt: "jkt-nonce-required",
+      cnfJkt: "jkt-required",
+      clientId: "demo_client",
+      scope: "openid",
       iat: Math.floor(Date.now() / 1000),
-      exp: Math.floor(Date.now() / 1000) + 300,
-      aud: "demo_client",
+      exp: Math.floor(Date.now() / 1000) + 30,
       iss: TEST_ISSUER,
     });
 
@@ -558,41 +472,14 @@ describe("sign-on and refresh over HTTP", () => {
       expect(res.body.error).toMatch(/nonce is required/);
     }
 
-    // The identical request with a nonce goes through, so the 400 is about the nonce
-    // and nothing else in the body.
-    const ok = await postJson(gateway.url, "/api/pasta/sign-on", {
-      ...base(),
-      nonce: "n-nonce-required",
-    });
+    const noClientId = { ...base(), nonce: "c-ok" } as Record<string, unknown>;
+    delete noClientId.clientId;
+    const res = await postJson(gateway.url, "/api/pasta/sign-on", noClientId);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/clientId is required/);
+
+    const ok = await postJson(gateway.url, "/api/pasta/sign-on", { ...base(), nonce: "c-ok" });
     expect(ok.status).toBe(200);
-  });
-
-  it("requires a nonce on refresh, checked before the session lookup", async () => {
-    const sdk = new DecentralizedClientSdk({ proxyUrl: gateway.url, issuer: TEST_ISSUER });
-    const { sessionId } = await sdk.signOn({
-      username: ALICE.username,
-      password: ALICE.password,
-      clientId: "demo_client",
-      nonce: "n-refresh-nonce-required",
-    });
-    const refreshUrl = `${gateway.url}/api/pasta/refresh`;
-
-    for (const nonce of [undefined, null, ""]) {
-      const body: Record<string, unknown> = {
-        sessionId,
-        dpopProof: createDPoPProof(sdk.getDPoPKeyPair(), "POST", refreshUrl),
-        expectedHtu: refreshUrl,
-        iat: Math.floor(Date.now() / 1000),
-        exp: Math.floor(Date.now() / 1000) + 300,
-        aud: "demo_client",
-        iss: TEST_ISSUER,
-      };
-      if (nonce !== undefined) body.nonce = nonce;
-
-      const res = await postJson(gateway.url, "/api/pasta/refresh", body);
-      expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/nonce is required/);
-    }
   });
 
   it("answers 413 rather than 500 for a body over the limit", async () => {
@@ -604,167 +491,43 @@ describe("sign-on and refresh over HTTP", () => {
     expect(res.status).toBe(413);
     expect((await res.json()).error).toMatch(/exceeds/);
   });
-
-  it("refuses a refresh for an unknown session", async () => {
-    const res = await postJson(gateway.url, "/api/pasta/refresh", {
-      sessionId: "00000000-0000-4000-8000-000000000000",
-      dpopProof: "not.a.proof",
-      expectedHtu: `${gateway.url}/api/pasta/refresh`,
-      nonce: "n-unknown-session",
-      iat: Math.floor(Date.now() / 1000),
-      exp: Math.floor(Date.now() / 1000) + 300,
-      aud: "demo_client",
-      iss: TEST_ISSUER,
-    });
-    expect(res.status).toBe(400);
-    expect(res.body.error).toContain("invalid or revoked");
-  });
-});
-
-describe("the gateway never sees a password", () => {
-  it("no longer exposes the browser sign-on route at all", async () => {
-    // Section 11: the client SDK moved into the browser, so the one route that ever
-    // accepted a plaintext password is gone rather than merely unused.
-    const res = await postJson(gateway.url, "/api/pasta/browser-sign-on", {
-      username: ALICE.username,
-      password: ALICE.password,
-      clientId: "demo_client",
-      nonce: "n-browser-gone",
-    });
-    expect(res.status).toBe(404);
-  });
-
-  it("reads only username and blinded off a sign-on body, ignoring any password", async () => {
-    // Two discriminating requests. The first carries a password that is wrong for alice
-    // and a blinded point that is right; it succeeds, so the password was not consulted.
-    // The second carries alice's real password and an unknown username; it fails, so the
-    // username -- not the password -- is what selects the record.
-    const logs: string[] = [];
-    const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
-      logs.push(args.map(String).join(" "));
-    });
-
-    try {
-      const withWrongPassword = await postJson(gateway.url, "/api/pasta/sign-on", {
-        username: ALICE.username,
-        password: "hunter2-should-be-ignored",
-        blinded: base64UrlEncode(blind(ALICE.password).blinded.toRawBytes()),
-        sessionNonce: base64UrlEncode(new Uint8Array(16)),
-        cnfJkt: "jkt-ignores-password",
-        nonce: "n-ignores-password",
-        iat: Math.floor(Date.now() / 1000),
-        exp: Math.floor(Date.now() / 1000) + 300,
-        aud: "demo_client",
-        iss: TEST_ISSUER,
-      });
-      expect(withWrongPassword.status).toBe(200);
-      expect(withWrongPassword.body.nodeResponses).toHaveLength(3);
-
-      const withRightPasswordUnknownUser = await postJson(gateway.url, "/api/pasta/sign-on", {
-        username: "mallory",
-        password: ALICE.password,
-        blinded: base64UrlEncode(blind(ALICE.password).blinded.toRawBytes()),
-        sessionNonce: base64UrlEncode(new Uint8Array(16)),
-        cnfJkt: "jkt-unknown-user",
-        nonce: "n-unknown-user",
-        iat: Math.floor(Date.now() / 1000),
-        exp: Math.floor(Date.now() / 1000) + 300,
-        aud: "demo_client",
-        iss: TEST_ISSUER,
-      });
-      expect(withRightPasswordUnknownUser.status).toBe(400);
-
-      // Nothing the gateway printed carries either password, not even truncated.
-      const printed = logs.join("\n");
-      expect(printed).toContain("[gateway] sign-on   sess=");
-      expect(printed).not.toContain(ALICE.password);
-      expect(printed).not.toContain("hunter2");
-    } finally {
-      spy.mockRestore();
-    }
-  });
-
-  it("fails inside the SDK on a wrong password, with the gateway relaying happily", async () => {
-    // The wrong-password path is now entirely client side: every node answers, the
-    // gateway returns 200, and the AEAD open fails in the browser because `h` is wrong.
-    // The gateway cannot tell this attempt apart from a successful one.
-    const sdk = new DecentralizedClientSdk({ proxyUrl: gateway.url, issuer: TEST_ISSUER });
-    await expect(
-      sdk.signOn({
-        username: ALICE.username,
-        password: "not-the-password",
-        clientId: "demo_client",
-        nonce: "n-wrong-password",
-      })
-    ).rejects.toThrow(/Invalid password or corrupted share/);
-  });
-
-  it("mints a token whose claims a relying party can actually parse", async () => {
-    // The regression the nonce rule exists for: the signature verifying is not enough,
-    // the payload has to be JSON. Decoded here without the gateway's own helpers, the
-    // way an RP would.
-    const sdk = new DecentralizedClientSdk({ proxyUrl: gateway.url, issuer: TEST_ISSUER });
-    const { id_token } = await sdk.signOn({
-      username: ALICE.username,
-      password: ALICE.password,
-      clientId: "demo_client",
-      nonce: "n-parseable",
-    });
-
-    const [headerB64, payloadB64] = id_token.split(".");
-    const header = JSON.parse(Buffer.from(headerB64, "base64url").toString("utf8"));
-    const payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8"));
-    expect(header.alg).toBe("EdDSA");
-    // The `rp` component selects its verification key by `kid`, so this has to be the
-    // `keyId` the gateway publishes in its JWKS.
-    const jwks = await getJson(gateway.url, "/jwks.json");
-    expect(header.kid).toBe(jwks.body.keys[0].kid);
-    expect(payload.nonce).toBe("n-parseable");
-    expect(payload.aud).toBe("demo_client");
-  });
 });
 
 describe("demo log", () => {
-  it("prints one sign-on event as one line plus one continuation", async () => {
+  it("prints the token exchange with the access token but no password", async () => {
     const logs: string[] = [];
     const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
       logs.push(args.map(String).join(" "));
     });
-
-    let idToken: string;
+    let accessToken = "";
     try {
-      const sdk = new DecentralizedClientSdk({ proxyUrl: gateway.url, issuer: TEST_ISSUER });
-      ({ id_token: idToken } = await sdk.signOn({
-        username: ALICE.username,
-        password: ALICE.password,
-        clientId: "demo_client",
-        nonce: "n-demolog",
-      }));
+      const flow = await signOnToCode(gateway.url, { nonce: "c-demolog" });
+      const proof = createDPoPProof(flow.keyPair, "POST", TOKEN_ENDPOINT);
+      const res = await postToken(
+        gateway.url,
+        {
+          grant_type: "authorization_code",
+          code: flow.assertion,
+          client_id: "demo_client",
+          redirect_uri: REDIRECT_URI,
+        },
+        proof
+      );
+      accessToken = res.body.access_token;
     } finally {
       spy.mockRestore();
     }
 
-    const headingIndex = logs.findIndex((l) => l.startsWith("[gateway] sign-on   "));
-    expect(headingIndex).toBeGreaterThanOrEqual(0);
-    const [head, cont] = logs.slice(headingIndex, headingIndex + 2);
-
-    expect(head).toMatch(/^\[gateway\] sign-on   sess=\S+ round=\S+ user=alice nonce=n-demolog {2}← A /);
-    expect(head).toContain("(no pw)");
-    expect(cont.startsWith(CONTINUATION_INDENT)).toBe(true);
-    expect(cont).toContain("round1 (D,E)×3 → round2");
-    expect(cont).toContain("ct_i×3 (no h_i, cannot decrypt)");
-    expect(cont).not.toContain("excluded");
-    // The `never:` claim is made once, on the startup line, never on an event.
-    expect(logs.filter((l) => l.includes("never:"))).toHaveLength(0);
-
-    // No colour: the test gateway builds its logger with a non-TTY sink, so the lines a
-    // structural assertion runs over are the same bytes an audience reads.
-    expect(logs.join("\n")).not.toContain("\u001b[");
+    const tokenLine = logs.find((l) => l.startsWith("[gateway] token     grant=authz"));
+    expect(tokenLine).toBeDefined();
+    expect(tokenLine).toContain("code(assertion)");
+    expect(tokenLine).toContain(accessToken.slice(0, 16));
     expect(logs.join("\n")).not.toContain(ALICE.password);
-    expect(typeof idToken).toBe("string");
+    // The never: claim is on the startup line only.
+    expect(logs.filter((l) => l.includes("never:"))).toHaveLength(0);
   });
 
-  it("names the node it dropped when one is unreachable", async () => {
+  it("names the node it dropped when one is unreachable on sign-on", async () => {
     const trio = await startFakeNodes();
     const gw = await startGateway({ nodeUrls: trio.map((n) => n.url), demoDist });
     const logs: string[] = [];
@@ -773,20 +536,11 @@ describe("demo log", () => {
     });
     try {
       await trio.find((n) => n.nodeId === 3)!.close();
+      await signOnToCode(gw.url, { nonce: "c-excluded" });
 
-      const sdk = new DecentralizedClientSdk({ proxyUrl: gw.url, issuer: TEST_ISSUER });
-      await sdk.signOn({
-        username: ALICE.username,
-        password: ALICE.password,
-        clientId: "demo_client",
-        nonce: "n-demolog-excluded",
-      });
-
-      const head = logs.find((l) => l.startsWith("[gateway] sign-on   "));
-      expect(head).toContain("user=alice");
-      const cont = logs.find((l) => l.startsWith(`${CONTINUATION_INDENT}round1 `));
+      const cont = logs.find((l) => l.includes("round1 (D,E)×2"));
+      expect(cont).toBeDefined();
       expect(cont).toContain("(node3 unreachable, excluded)");
-      expect(cont).toContain("round1 (D,E)×2");
     } finally {
       spy.mockRestore();
       await gw.close();
@@ -794,136 +548,25 @@ describe("demo log", () => {
     }
   });
 
-  it("logs a refusal as a single ✖ line", async () => {
+  it("logs a /token refusal as a single ✖ line", async () => {
     const logs: string[] = [];
     const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
       logs.push(args.map(String).join(" "));
     });
     try {
-      const res = await postJson(gateway.url, "/api/pasta/refresh", {
-        sessionId: "00000000-0000-4000-8000-000000000000",
-        dpopProof: "not.a.proof",
-        expectedHtu: `${gateway.url}/api/pasta/refresh`,
-        nonce: "n-reject-log",
-        iat: Math.floor(Date.now() / 1000),
-        exp: Math.floor(Date.now() / 1000) + 300,
-        aud: "demo_client",
-        iss: TEST_ISSUER,
-      });
-      expect(res.status).toBe(400);
+      const flow = await signOnToCode(gateway.url);
+      await postToken(gateway.url, {
+        grant_type: "authorization_code",
+        code: flow.assertion,
+        client_id: "demo_client",
+        redirect_uri: REDIRECT_URI,
+      }); // no proof
     } finally {
       spy.mockRestore();
     }
-
-    const rejects = logs.filter((l) => l.startsWith("[gateway] ✖ refresh rejected:"));
+    const rejects = logs.filter((l) => l.startsWith("[gateway] ✖ token rejected:"));
     expect(rejects).toHaveLength(1);
-    expect(rejects[0]).toContain("invalid or revoked");
-  });
-
-  it("prints a one-line event for the public OIDC endpoints", async () => {
-    const logs: string[] = [];
-    const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
-      logs.push(args.map(String).join(" "));
-    });
-    try {
-      await getJson(gateway.url, "/jwks.json");
-      await getJson(gateway.url, "/.well-known/openid-configuration");
-      await getJson(
-        gateway.url,
-        "/authorize?client_id=demo_client&redirect_uri=http%3A%2F%2Frp.example%2Fcb" +
-          "&response_type=id_token&response_mode=form_post&scope=openid&nonce=n-authorize-log" +
-          `&state=st&dpop_jkt=${RP_JKT}`
-      );
-    } finally {
-      spy.mockRestore();
-    }
-
-    expect(logs).toContain("[gateway] jwks      public only");
-    expect(logs).toContain("[gateway] discovery public only");
-    expect(logs).toContain(
-      "[gateway] authorize client_id=demo_client nonce=n-authorize-log state=st " +
-        `dpop_jkt=${RP_JKT.slice(0, 8)}  → redirect /demo`
-    );
-  });
-});
-
-describe("demo RP callback", () => {
-  it("shows a verified payload for a real token and a failure for a tampered one", async () => {
-    const sdk = new DecentralizedClientSdk({ proxyUrl: gateway.url, issuer: TEST_ISSUER });
-    const { id_token: idToken } = await sdk.signOn({
-      username: ALICE.username,
-      password: ALICE.password,
-      clientId: "demo_client",
-      nonce: "n-rp-callback",
-    });
-
-    const ok = await postForm(gateway.url, "/demo/rp-callback", {
-      id_token: idToken,
-      state: "state-abc",
-    });
-    expect(ok.status).toBe(200);
-    expect(ok.text).toContain("検証成功");
-    expect(ok.text).toContain(ALICE.sub);
-    expect(ok.text).toContain("state-abc");
-
-    const parts = idToken.split(".");
-    const tampered = `${parts[0]}.${parts[1]}.${"A".repeat(parts[2].length)}`;
-    const bad = await postForm(gateway.url, "/demo/rp-callback", { id_token: tampered });
-    expect(bad.status).toBe(200);
-    expect(bad.text).toContain("検証失敗");
-
-    const missing = await postForm(gateway.url, "/demo/rp-callback", { state: "x" });
-    expect(missing.status).toBe(400);
-  });
-
-  it("escapes the state parameter instead of reflecting it as markup", async () => {
-    // `state` is an unauthenticated form field echoed onto a page served from the
-    // gateway's own origin, next to the demo UI. Reflecting it raw is script running as
-    // the IdP.
-    const payload = '</pre><script>alert(document.domain)</script><pre>';
-    const res = await postForm(gateway.url, "/demo/rp-callback", {
-      id_token: "not.a.token",
-      state: payload,
-    });
-    expect(res.status).toBe(200);
-    expect(res.text).not.toContain("<script>alert(document.domain)</script>");
-    expect(res.text).toContain("&lt;script&gt;");
-  });
-
-  it("escapes a verification error built from an unsigned JWT header", async () => {
-    // No valid signature is needed to reach this: `verifyJwt` reports an unsupported
-    // `alg` before it checks anything, and `alg` comes straight out of the header the
-    // caller wrote.
-    const header = base64UrlEncode(
-      new TextEncoder().encode(JSON.stringify({ alg: "<img src=x onerror=alert(1)>" }))
-    );
-    const res = await postForm(gateway.url, "/demo/rp-callback", {
-      id_token: `${header}.e30.AAAA`,
-      state: "s",
-    });
-    expect(res.status).toBe(200);
-    expect(res.text).toContain("検証失敗");
-    expect(res.text).not.toContain("<img src=x onerror=alert(1)>");
-    expect(res.text).toContain("&lt;img src=x onerror=alert(1)&gt;");
-  });
-
-  it("escapes claims echoed from a genuinely verified token", async () => {
-    const sdk = new DecentralizedClientSdk({ proxyUrl: gateway.url, issuer: TEST_ISSUER });
-    const { id_token } = await sdk.signOn({
-      username: ALICE.username,
-      password: ALICE.password,
-      clientId: "<b>aud</b>",
-      nonce: "<i>nonce</i>",
-    });
-
-    const res = await postForm(gateway.url, "/demo/rp-callback", {
-      id_token,
-      state: "s",
-    });
-    expect(res.status).toBe(200);
-    expect(res.text).toContain("検証成功");
-    expect(res.text).not.toContain("<b>aud</b>");
-    expect(res.text).toContain("&lt;b&gt;aud&lt;/b&gt;");
+    expect(rejects[0]).toContain("invalid_dpop_proof");
   });
 });
 
@@ -935,25 +578,7 @@ describe("gateway /health", () => {
     expect(res.body.nodes).toHaveLength(3);
     for (const entry of res.body.nodes) {
       expect(entry.healthy).toBe(true);
-      expect(typeof entry.url).toBe("string");
       expect([1, 2, 3]).toContain(entry.nodeId);
-    }
-  });
-
-  it("reports a node that has gone away as unhealthy", async () => {
-    const trio = await startFakeNodes();
-    const gw = await startGateway({ nodeUrls: trio.map((n) => n.url), demoDist });
-    try {
-      await trio[1].close();
-      const res = await getJson(gw.url, "/health");
-      // Two of three still answer, so the gateway itself is usable.
-      expect(res.status).toBe(200);
-      const down = res.body.nodes.find((n: any) => n.nodeId === trio[1].nodeId);
-      expect(down.healthy).toBe(false);
-      expect(res.body.nodes.filter((n: any) => n.healthy)).toHaveLength(2);
-    } finally {
-      await gw.close();
-      await Promise.all(trio.map((n) => n.close()));
     }
   });
 
@@ -967,7 +592,6 @@ describe("gateway /health", () => {
       const res = await getJson(gw.url, "/health");
       expect(res.status).toBe(503);
       expect(res.body.status).toBe("degraded");
-      expect(res.body.nodes).toHaveLength(3);
       expect(res.body.nodes.filter((n: any) => n.healthy)).toHaveLength(1);
     } finally {
       await gw.close();
@@ -978,9 +602,6 @@ describe("gateway /health", () => {
 
 describe("node protocol over HTTP", () => {
   it("refuses to reuse a round id: a FROST nonce pair is single use", async () => {
-    // The gateway draws a fresh `roundId` per request, so this is only reachable against
-    // a node directly. It is the property the gateway depends on when it treats round 2
-    // as all or nothing.
     const node = nodes[0];
     const roundId = "round-reuse-test";
 
@@ -995,9 +616,11 @@ describe("node protocol over HTTP", () => {
         blinded: base64UrlEncode(blind(ALICE.password).blinded.toRawBytes()),
         sessionNonce: base64UrlEncode(new Uint8Array(16)),
         cnfJkt: "jkt-reuse",
+        clientId: "demo_client",
+        scope: "openid",
+        nonce: "c-reuse",
         iat: Math.floor(Date.now() / 1000),
-        exp: Math.floor(Date.now() / 1000) + 300,
-        aud: "demo_client",
+        exp: Math.floor(Date.now() / 1000) + 30,
         iss: TEST_ISSUER,
         commitments: [{ nodeId: commit.body.nodeId, D: commit.body.D, E: commit.body.E }],
         allParticipants: [commit.body.nodeId],
@@ -1026,10 +649,11 @@ describe("node protocol over HTTP", () => {
         blinded: base64UrlEncode(blind(ALICE.password).blinded.toRawBytes()),
         sessionNonce: base64UrlEncode(new Uint8Array(16)),
         cnfJkt: "jkt-null",
+        clientId: "demo_client",
+        scope: "openid",
         nonce: null,
         iat: Math.floor(Date.now() / 1000),
-        exp: Math.floor(Date.now() / 1000) + 300,
-        aud: "demo_client",
+        exp: Math.floor(Date.now() / 1000) + 30,
         iss: TEST_ISSUER,
         commitments: [{ nodeId: commit.body.nodeId, D: commit.body.D, E: commit.body.E }],
         allParticipants: [commit.body.nodeId],

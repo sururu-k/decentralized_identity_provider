@@ -1,19 +1,35 @@
 import crypto from "node:crypto";
-import { RefreshResponse, SignOnResponse } from "../protocol/types.js";
-import { FrostCommitment } from "../crypto/frost.js";
+import { Grant, SignOnResponse } from "../protocol/types.js";
+import {
+  FrostCommitment,
+  aggregateSignatureShares,
+  computeGroupCommitment,
+} from "../crypto/frost.js";
+import { assembleJwt, base64UrlDecode, createSigningInput } from "../jwt/jwt.js";
 import { DemoLog, ExcludedNode, createDemoLog } from "../demolog.js";
 import { NodeClient } from "../nodes/client.js";
-import { GatewaySessionManager } from "./session.js";
+
+/** Group signing key id stamped into every JWT header (dealer contract). */
+export const DEFAULT_KEY_ID = "pasta-group-key-1";
+
+/** Access token lifetime the gateway pins, in seconds (section 14: 1 hour). */
+export const ACCESS_TOKEN_LIFETIME_SECONDS = 3600;
+
+/** Refresh token lifetime the gateway pins, in seconds (section 14: 30 days). */
+export const REFRESH_TOKEN_LIFETIME_SECONDS = 86400 * 30;
 
 export interface ProxySignOnRequestBody {
   username: string;
   blinded: string; // base64url of Ristretto255 blinded point A
   sessionNonce: string; // base64url of session nonce
   cnfJkt: string;
+  /** OAuth `client_id`, signed into the assertion. */
+  clientId: string;
+  /** OAuth `scope`, signed into the assertion. May be empty. */
+  scope: string;
   nonce?: string;
   iat: number;
   exp: number;
-  aud: string;
   iss: string;
   participants?: number[];
 }
@@ -24,51 +40,48 @@ export interface ProxySignOnResult {
   nodeResponses: SignOnResponse[];
 }
 
-export interface ProxyRefreshRequestBody {
-  sessionId: string;
-  dpopProof: string;
-  expectedHtu: string;
-  nonce?: string;
-  iat: number;
-  exp: number;
-  aud: string;
-  iss: string;
-  participants?: number[];
+/** What `/token` hands back once the two tokens are synthesised. */
+export interface ProxyTokenResult {
+  accessToken: string;
+  refreshToken: string;
+  /** Access token lifetime, for the `expires_in` field. */
+  expiresIn: number;
+  /** Scope carried in the credential, echoed back to the client. */
+  scope: string;
+  /** `cnf.jkt` the tokens are bound to. For the demo log only. */
+  cnfJkt: string;
 }
 
-export interface ProxyRefreshResult {
-  sessionId: string;
-  commitments: FrostCommitment[];
-  nodeResponses: RefreshResponse[];
+/** The identity fields `/token` reads out of the credential it was handed. */
+export interface CredentialClaims {
+  sub: string;
+  client_id: string;
+  scope: string;
+  cnf: { jkt: string };
+}
+
+/** A credential (an assertion or a refresh token) that will not parse or is malformed. */
+export class InvalidCredentialError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidCredentialError";
+  }
 }
 
 /**
- * OAuth / PASTA Proxy
+ * OAuth / PASTA Proxy (`docs/container-split.md` section 14).
  *
- * Implements the core architecture from docs/whiteboard-gaps.md:
- * "The Proxy DOES NOT hold tokens, cannot forge signatures, and CANNOT decrypt ct_i."
+ * The gateway holds **no user state**: no authorize session, no code store, no refresh
+ * token store, no `sub`. It relays the sign-on rounds that mint an assertion, and it
+ * relays the `/token` rounds that mint an access token and the next refresh token,
+ * synthesising the two group signatures from the plaintext `z_i` shares each node
+ * returns. It cannot decrypt a `ct_i` (it holds no `h_i`) and it cannot forge a
+ * signature (it holds no key share), so the assertion can only be assembled by a client
+ * that knows the password, and a token can only be minted when a threshold of nodes each
+ * verify the credential and the DPoP proof for themselves.
  *
- * It purely acts as a blinded relay between the user's browser and threshold nodes.
- *
- * Ported from the monolith's `src/gateway/proxy.ts`. Two things changed and nothing else:
- * a node is now a `NodeClient` (an HTTP endpoint) instead of an in-process
- * `IdentityNode`, and round 1 tolerates nodes that fail to answer, so a quorum can still
- * form while one of three nodes is down. The orchestration order is the original's:
- * round id -> commitments from every participant -> session id -> round 2 to the same
- * participants -> register the session.
- *
- * The demo log (`docs/container-split.md` section 10) is emitted from here rather than
- * from the route handler because this is the only place that knows which nodes were left
- * out of the round, and because the whole event -- one line plus its continuation -- has
- * to be written in one go once both rounds are done, or concurrent requests would
- * interleave their lines.
- */
-/**
- * A round that could not reach the threshold.
- *
- * The `message` is the one this class always produced and is what the HTTP response still
- * carries; the extra fields exist only so the demo log can render section 10's compact
- * `quorum 1 < 2 (node2, node3 unreachable)` reason without parsing that sentence back.
+ * Every value that flows through here is either public, a blinded / encrypted per-session
+ * value, or a finished token bound to a `cnf.jkt` no third party can exercise.
  */
 export class QuorumError extends Error {
   constructor(
@@ -86,24 +99,23 @@ export class QuorumError extends Error {
 
 export class PastaOAuthProxy {
   private nodes: Map<number, NodeClient>;
-  private sessionManager: GatewaySessionManager;
   private demoLog: DemoLog;
   public readonly threshold: number;
+  public readonly issuer: string;
+  public readonly keyId: string;
 
   constructor(
     nodes: NodeClient[],
     threshold: number = 2,
-    sessionManager?: GatewaySessionManager,
-    demoLog?: DemoLog
+    demoLog?: DemoLog,
+    issuer: string = "http://localhost:3000",
+    keyId: string = DEFAULT_KEY_ID
   ) {
     this.nodes = new Map(nodes.map((n) => [n.nodeId, n]));
     this.threshold = threshold;
-    this.sessionManager = sessionManager || new GatewaySessionManager();
     this.demoLog = demoLog ?? createDemoLog();
-  }
-
-  public getSessionManager(): GatewaySessionManager {
-    return this.sessionManager;
+    this.issuer = issuer.replace(/\/+$/, "");
+    this.keyId = keyId;
   }
 
   /** Every node the gateway knows about, in ascending node id order. */
@@ -181,13 +193,13 @@ export class PastaOAuthProxy {
   }
 
   /**
-   * Relay endpoint for /api/pasta/sign-on
+   * Relay endpoint for `POST /api/pasta/sign-on`.
    *
-   * Orchestrates 2-round FROST threshold signing across distributed nodes.
-   * PROXY GUARANTEE:
-   * The proxy receives only encrypted ciphertext shares ct_i from nodes.
-   * Because the proxy never possesses user passwords or h_i,
-   * it is mathematically impossible for the proxy to inspect, steal, or forge the token.
+   * Orchestrates a two-round FROST threshold signature over the authentication assertion.
+   * The gateway receives only the encrypted shares `ct_i` from nodes; because it never
+   * holds the password or any `h_i`, it cannot inspect, steal, or forge the assertion.
+   * It keeps no session record -- the assertion the client walks away with is the whole
+   * artefact (section 14.2).
    */
   public async handleSignOn(body: ProxySignOnRequestBody): Promise<ProxySignOnResult> {
     const explicit = body.participants !== undefined;
@@ -203,16 +215,16 @@ export class PastaOAuthProxy {
 
     const roundId = crypto.randomUUID();
 
-    // Round 1: Gather FROST commitments from participants
+    // Round 1: gather FROST commitments from participants.
     const { commitments, participants, excluded } = await this.collectCommitments(
       roundId,
       requested,
       explicit
     );
 
-    // Round 2: Relay sign-on request to each node with common session ID
-    // Every participant of round 2 must succeed: the group commitment R and the Lagrange
-    // coefficients are fixed by the commitment set, so a partial answer cannot aggregate.
+    // Round 2: relay the sign-on request to each node with a common session id. Every
+    // participant must succeed: the group commitment R and the Lagrange coefficients are
+    // fixed by the commitment set, so a partial answer cannot aggregate.
     const sessionId = crypto.randomUUID();
     const nodeResponses = await Promise.all(
       commitments.map((comm) => {
@@ -225,10 +237,11 @@ export class PastaOAuthProxy {
             blinded: body.blinded,
             sessionNonce: body.sessionNonce,
             cnfJkt: body.cnfJkt,
+            clientId: body.clientId,
+            scope: body.scope,
             nonce: body.nonce,
             iat: body.iat,
             exp: body.exp,
-            aud: body.aud,
             iss: body.iss,
             commitments,
             allParticipants: participants,
@@ -238,15 +251,8 @@ export class PastaOAuthProxy {
       })
     );
 
-    // Proxy registers opaque sessionId for routing, but cannot decrypt anything.
-    // The participant list is kept so a later refresh goes back to the same quorum:
-    // only those nodes hold an rs_i for this session, and only for those does the
-    // client hold the matching secret.
-    this.sessionManager.registerSession(sessionId, participants);
-
-    // Both rounds are done, so the whole event can be written at once. Note what is
-    // absent: there is no password to redact, only the blinded point the gateway cannot
-    // open (section 11 removed the one route that ever saw a password).
+    // Both rounds are done, so the whole event is written at once. Nothing here carries a
+    // password: only the blinded point the gateway cannot open (section 11).
     this.demoLog.signOn({
       sessionId,
       roundId,
@@ -258,32 +264,31 @@ export class PastaOAuthProxy {
       excluded,
     });
 
-    return {
-      sessionId,
-      commitments,
-      nodeResponses,
-    };
+    return { sessionId, commitments, nodeResponses };
   }
 
   /**
-   * Relay endpoint for /api/pasta/refresh
+   * Relay endpoint for `POST /token`, both grants (section 14).
    *
-   * Relays refresh requests with DPoP proof to distributed nodes.
-   * PROXY GUARANTEE:
-   * Nodes verify DPoP proof independently.
-   * Nodes encrypt new shares with rk_i = HKDF(rs_i, ctr).
-   * Proxy has no access to rs_i, so ct_i cannot be decrypted by the proxy.
+   * The gateway hands the credential (an assertion for `authorization_code`, a refresh
+   * token for `refresh_token`) and the DPoP proof to each node, which verifies both for
+   * itself and returns the plaintext `z_i` share of the access token and of the next
+   * refresh token. The gateway synthesises the two group signatures and assembles the two
+   * JWTs; it keeps no state and mints no signature of its own.
+   *
+   * Two FROST rounds are consumed, one per signature, so a node's Schnorr nonce pair is
+   * never reused across the two messages. The refresh round runs against the exact
+   * participant set of the access round, so both signatures share `allParticipants` and
+   * the shares aggregate.
    */
-  public async handleRefresh(body: ProxyRefreshRequestBody): Promise<ProxyRefreshResult> {
-    if (!this.sessionManager.isSessionActive(body.sessionId)) {
-      throw new Error(`Session ${body.sessionId} is invalid or revoked`);
-    }
+  public async handleSign(
+    grant: Grant,
+    credential: string,
+    dpopProof: string
+  ): Promise<ProxyTokenResult> {
+    const claims = decodeCredentialClaims(credential);
 
-    const explicit = body.participants !== undefined;
-    const requested =
-      body.participants ||
-      this.sessionManager.getSessionParticipants(body.sessionId) ||
-      Array.from(this.nodes.keys());
+    const requested = Array.from(this.nodes.keys());
     if (requested.length < this.threshold) {
       throw new QuorumError(
         `Insufficient nodes for threshold quorum: need at least ${this.threshold}`,
@@ -293,54 +298,153 @@ export class PastaOAuthProxy {
       );
     }
 
-    const roundId = crypto.randomUUID();
+    const accessRoundId = crypto.randomUUID();
+    const refreshRoundId = crypto.randomUUID();
 
-    // Round 1: Gather commitments
-    const { commitments, participants, excluded } = await this.collectCommitments(
-      roundId,
-      requested,
-      explicit
-    );
+    // Round 1 for the access token, tolerating nodes that fail to commit.
+    const access = await this.collectCommitments(accessRoundId, requested, false);
+    // Round 1 for the refresh token, against exactly that participant set: all must
+    // answer, so the two signatures aggregate over the same nodes.
+    const refresh = await this.collectCommitments(refreshRoundId, access.participants, true);
+    const participants = access.participants;
 
-    // Round 2: Relay refresh request
+    const iat = Math.floor(Date.now() / 1000);
+    const accessExp = iat + ACCESS_TOKEN_LIFETIME_SECONDS;
+    const refreshExp = iat + REFRESH_TOKEN_LIFETIME_SECONDS;
+    const jti = crypto.randomUUID();
+
     const nodeResponses = await Promise.all(
-      commitments.map((comm) => {
+      access.commitments.map((comm) => {
         const node = this.nodes.get(comm.nodeId)!;
-        return node.refresh(
-          roundId,
+        const rtComm = refresh.commitments.find((c) => c.nodeId === comm.nodeId)!;
+        return node.sign(
+          accessRoundId,
+          refreshRoundId,
           {
-            sessionId: body.sessionId,
-            dpopProof: body.dpopProof,
-            expectedHtu: body.expectedHtu,
-            nonce: body.nonce,
-            iat: body.iat,
-            exp: body.exp,
-            aud: body.aud,
-            iss: body.iss,
-            commitments,
+            grant,
+            assertion: grant === "authorization_code" ? credential : undefined,
+            refreshToken: grant === "refresh_token" ? credential : undefined,
+            dpopProof,
+            claims: { iat, exp: accessExp, jti },
+            refreshExp,
+            commitments: access.commitments,
+            refreshCommitments: refresh.commitments,
             allParticipants: participants,
           },
-          { D: comm.D, E: comm.E }
+          { D: comm.D, E: comm.E },
+          { D: rtComm.D, E: rtComm.E }
         );
       })
     );
 
-    const updatedCtr = nodeResponses.length > 0 ? nodeResponses[nodeResponses.length - 1].ctr : 0;
+    // Rebuild the byte-identical signing inputs the nodes signed. Every node runs the
+    // frozen `createSigningInput` over the same header and payload, so the gateway does
+    // too, and the shares aggregate into a signature the published JWKS verifies.
+    const accessToken = this.assembleToken(
+      { alg: "EdDSA", typ: "at+jwt", kid: this.keyId },
+      {
+        iss: this.issuer,
+        sub: claims.sub,
+        aud: claims.client_id,
+        scope: claims.scope,
+        cnf: { jkt: claims.cnf.jkt },
+        iat,
+        exp: accessExp,
+        jti,
+      },
+      access.commitments,
+      nodeResponses.map((r) => r.at.z_i)
+    );
 
-    this.sessionManager.recordRefresh(body.sessionId, updatedCtr);
+    const refreshToken = this.assembleToken(
+      { alg: "EdDSA", typ: "refresh+jwt", kid: this.keyId },
+      {
+        iss: this.issuer,
+        sub: claims.sub,
+        cnf: { jkt: claims.cnf.jkt },
+        client_id: claims.client_id,
+        scope: claims.scope,
+        iat,
+        exp: refreshExp,
+      },
+      refresh.commitments,
+      nodeResponses.map((r) => r.rt.z_i)
+    );
 
-    this.demoLog.refresh({
-      sessionId: body.sessionId,
-      roundId,
+    this.demoLog.token({
+      grant,
+      credential,
+      accessToken,
+      cnfJkt: claims.cnf.jkt,
       participants,
-      dpopProof: body.dpopProof,
-      excluded,
+      excluded: access.excluded,
     });
 
     return {
-      sessionId: body.sessionId,
-      commitments,
-      nodeResponses,
+      accessToken,
+      refreshToken,
+      expiresIn: accessExp - iat,
+      scope: claims.scope,
+      cnfJkt: claims.cnf.jkt,
     };
   }
+
+  /** Aggregates the shares of one JWT into a group Ed25519 signature and assembles it. */
+  private assembleToken(
+    header: object,
+    payload: object,
+    commitments: FrostCommitment[],
+    shares: bigint[]
+  ): string {
+    const { signingInput, headerB64, payloadB64 } = createSigningInput(header, payload);
+    const R = computeGroupCommitment(signingInput, commitments);
+    const signature = aggregateSignatureShares(R, shares);
+    return assembleJwt(headerB64, payloadB64, signature);
+  }
+}
+
+/**
+ * Reads the identity fields a token is built from out of a credential.
+ *
+ * The gateway does **not** verify the group signature (the nodes do, each for itself);
+ * it only needs `sub`, `client_id`, `scope` and `cnf.jkt` to rebuild the byte-identical
+ * signing input, and `cnf.jkt` for the "proof key equals credential key" check the caller
+ * makes before this runs. A credential that is not a well-formed JWT, or that is missing
+ * an identity field, cannot yield a token and is rejected as an invalid grant.
+ */
+export function decodeCredentialClaims(credential: string): CredentialClaims {
+  const parts = credential.split(".");
+  if (parts.length !== 3) {
+    throw new InvalidCredentialError("credential is not a JWT");
+  }
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(Buffer.from(base64UrlDecode(parts[1])).toString("utf8"));
+  } catch {
+    throw new InvalidCredentialError("credential payload is not valid JSON");
+  }
+  if (typeof payload !== "object" || payload === null) {
+    throw new InvalidCredentialError("credential payload is not an object");
+  }
+
+  const str = (name: string): string => {
+    const value = payload[name];
+    if (typeof value !== "string" || value.length === 0) {
+      throw new InvalidCredentialError(`credential ${name} is missing`);
+    }
+    return value;
+  };
+
+  const cnf = payload.cnf as { jkt?: unknown } | undefined;
+  if (!cnf || typeof cnf.jkt !== "string" || cnf.jkt.length === 0) {
+    throw new InvalidCredentialError("credential cnf.jkt is missing");
+  }
+
+  return {
+    sub: str("sub"),
+    client_id: str("client_id"),
+    // An empty scope is a legitimate authorize request, so it is read as-is.
+    scope: typeof payload.scope === "string" ? payload.scope : "",
+    cnf: { jkt: cnf.jkt },
+  };
 }

@@ -2,32 +2,33 @@ import http from "node:http";
 import fs from "node:fs";
 import type { AddressInfo } from "node:net";
 import { fileURLToPath } from "node:url";
-import { base64UrlDecode, base64UrlEncode } from "../../src/jwt/jwt.js";
+import { base64UrlEncode, base64UrlDecode } from "../../src/jwt/jwt.js";
 import type { FrostCommitment } from "../../src/crypto/frost.js";
 import { IdentityNode } from "./protocol/node.js";
 import type {
-  RefreshRequest,
-  RefreshResponse,
   SignOnRequest,
   SignOnResponse,
+  SignRequest,
+  SignResponse,
 } from "./protocol/node.js";
 
 /**
- * A stand-in for the `node` container.
+ * A stand-in for the `node` container (`docs/container-split.md` sections 5 and 14).
  *
- * It wraps a copy of `IdentityNode` in the HTTP API of `docs/container-split.md`
- * section 5, so the gateway's e2e tests exercise the real transport: base64url on the
- * wire, one process-visible endpoint per node, and a real socket that can be closed to
- * simulate an outage. Nothing here is imported from the `node` project -- the two are
- * independent by contract.
+ * It wraps a copy of `IdentityNode` in the node's HTTP API, so the gateway's e2e tests
+ * exercise the real transport: base64url on the wire, one process-visible endpoint per
+ * node, and a real socket that can be closed to simulate an outage. Nothing here is
+ * imported from the `node` project -- the two are independent by contract.
  *
- * `helpers/protocol/node.ts` is a byte-identical copy of the monolith's
- * `src/protocol/node.ts`. That file imports "../crypto/frost.js", "../jwt/jwt.js" and so
- * on, and those specifiers have to resolve relative to its own directory, so
- * `helpers/crypto/`, `helpers/client-sdk/` and `helpers/jwt/` hold one-line re-export
- * shims pointing at the real copies under `gateway/src/`. No cryptographic code is
- * duplicated, and the copy stays diff-clean against the original.
+ * `helpers/protocol/node.ts` is a byte-identical copy of `node/src/protocol/node.ts`.
+ * That file imports "../crypto/frost.js", "../jwt/jwt.js" and so on, and those specifiers
+ * resolve relative to its own directory, so `helpers/crypto/`, `helpers/client-sdk/` and
+ * `helpers/jwt/` hold one-line re-export shims pointing at the real copies under
+ * `gateway/src/`. No cryptographic code is duplicated, and the copy stays diff-clean.
  */
+
+/** The issuer the fake nodes sign, and the gateway publishes. They must match (section 2). */
+export const TEST_ISSUER = "https://idp.test";
 
 export function fixturePath(name: string): string {
   return fileURLToPath(new URL(`../fixtures/${name}`, import.meta.url));
@@ -51,12 +52,13 @@ export function hexToScalar(hex: string): bigint {
   return BigInt("0x" + hex);
 }
 
-export function buildNodeFromFixture(name: string): IdentityNode {
+export function buildNodeFromFixture(name: string, issuer: string = TEST_ISSUER): IdentityNode {
   const config = readFixtureJson(name);
   const node = new IdentityNode(
     config.nodeId,
     hexToScalar(config.secretKeyShare),
-    hexToBytes(config.groupPublicKey)
+    hexToBytes(config.groupPublicKey),
+    issuer
   );
   for (const user of config.users) {
     node.registerUser(
@@ -143,12 +145,9 @@ function commitmentsFromWire(raw: any, where: string): FrostCommitment[] {
 }
 
 /**
- * Decodes the optional `nonce` exactly as the real node does.
- *
- * An absent `nonce` stays absent, so the payload the node signs omits the claim and
- * matches the one the client built. A literal `null` is a caller mistake and is refused,
- * which is what holds the gateway to `docs/container-split.md` section 5 in these tests
- * rather than letting a lenient stand-in paper over it.
+ * Decodes the optional `nonce` exactly as the real node does: an absent one stays absent,
+ * a literal `null` is refused. That keeps the gateway honest about section 5 in these
+ * tests rather than letting a lenient stand-in paper over it.
  */
 function applyNonce(target: { nonce?: string }, raw: any, where: string): void {
   if (!("nonce" in raw) || raw.nonce === undefined) {
@@ -160,22 +159,6 @@ function applyNonce(target: { nonce?: string }, raw: any, where: string): void {
   target.nonce = raw.nonce;
 }
 
-/**
- * The claim and round-1 fields both round-2 requests carry, validated exactly as
- * `node/src/wire.ts` validates them. A stand-in that accepted a body the real node
- * refuses would let a gateway bug pass the e2e suite.
- */
-function roundFieldsFromWire(obj: any, where: string) {
-  return {
-    iat: requireNumber(`${where}.iat`, obj.iat),
-    exp: requireNumber(`${where}.exp`, obj.exp),
-    aud: requireString(`${where}.aud`, obj.aud),
-    iss: requireString(`${where}.iss`, obj.iss),
-    commitments: commitmentsFromWire(obj.commitments, `${where}.commitments`),
-    allParticipants: requireIntegerArray(`${where}.allParticipants`, obj.allParticipants),
-  };
-}
-
 function signOnRequestFromWire(raw: any, where = "body.request"): SignOnRequest {
   const obj = requireObject(where, raw);
   const req: SignOnRequest = {
@@ -184,21 +167,45 @@ function signOnRequestFromWire(raw: any, where = "body.request"): SignOnRequest 
     blinded: requireNonEmptyString(`${where}.blinded`, obj.blinded),
     sessionNonce: requireNonEmptyString(`${where}.sessionNonce`, obj.sessionNonce),
     cnfJkt: requireNonEmptyString(`${where}.cnfJkt`, obj.cnfJkt),
-    ...roundFieldsFromWire(obj, where),
+    clientId: requireNonEmptyString(`${where}.clientId`, obj.clientId),
+    scope: requireString(`${where}.scope`, obj.scope),
+    iat: requireNumber(`${where}.iat`, obj.iat),
+    exp: requireNumber(`${where}.exp`, obj.exp),
+    iss: requireString(`${where}.iss`, obj.iss),
+    commitments: commitmentsFromWire(obj.commitments, `${where}.commitments`),
+    allParticipants: requireIntegerArray(`${where}.allParticipants`, obj.allParticipants),
   };
   applyNonce(req, obj, where);
   return req;
 }
 
-function refreshRequestFromWire(raw: any, where = "body.request"): RefreshRequest {
+function signRequestFromWire(raw: any, where = "body.request"): SignRequest {
   const obj = requireObject(where, raw);
-  const req: RefreshRequest = {
-    sessionId: requireNonEmptyString(`${where}.sessionId`, obj.sessionId),
+  const grant = requireNonEmptyString(`${where}.grant`, obj.grant);
+  if (grant !== "authorization_code" && grant !== "refresh_token") {
+    throw new Error(`${where}.grant must be authorization_code or refresh_token`);
+  }
+  const claims = requireObject(`${where}.claims`, obj.claims);
+  const req: SignRequest = {
+    grant,
     dpopProof: requireNonEmptyString(`${where}.dpopProof`, obj.dpopProof),
-    expectedHtu: requireNonEmptyString(`${where}.expectedHtu`, obj.expectedHtu),
-    ...roundFieldsFromWire(obj, where),
+    claims: {
+      iat: requireNumber(`${where}.claims.iat`, claims.iat),
+      exp: requireNumber(`${where}.claims.exp`, claims.exp),
+      jti: requireNonEmptyString(`${where}.claims.jti`, claims.jti),
+    },
+    commitments: commitmentsFromWire(obj.commitments, `${where}.commitments`),
+    refreshCommitments: commitmentsFromWire(obj.refreshCommitments, `${where}.refreshCommitments`),
+    allParticipants: requireIntegerArray(`${where}.allParticipants`, obj.allParticipants),
   };
-  applyNonce(req, obj, where);
+  if (grant === "authorization_code") {
+    req.assertion = requireNonEmptyString(`${where}.assertion`, obj.assertion);
+  } else {
+    req.refreshToken = requireNonEmptyString(`${where}.refreshToken`, obj.refreshToken);
+  }
+  if (obj.refreshExp !== undefined) {
+    req.refreshExp = requireNumber(`${where}.refreshExp`, obj.refreshExp);
+  }
   return req;
 }
 
@@ -213,13 +220,18 @@ function signOnResponseToWire(res: SignOnResponse) {
   };
 }
 
-function refreshResponseToWire(res: RefreshResponse) {
+function signedShareToWire(share: SignResponse["at"]) {
+  return {
+    commitment: { D: base64UrlEncode(share.commitment.D), E: base64UrlEncode(share.commitment.E) },
+    z_i: share.z_i,
+  };
+}
+
+function signResponseToWire(res: SignResponse) {
   return {
     nodeId: res.nodeId,
-    commitment: { D: base64UrlEncode(res.commitment.D), E: base64UrlEncode(res.commitment.E) },
-    ct_i: res.ct_i,
-    ctr: res.ctr,
-    sub: res.sub,
+    at: signedShareToWire(res.at),
+    rt: signedShareToWire(res.rt),
   };
 }
 
@@ -259,7 +271,7 @@ export function createFakeNodeServer(node: IdentityNode): http.Server {
         return;
       }
 
-      if (method !== "POST" || (path !== "/commit" && path !== "/sign-on" && path !== "/refresh")) {
+      if (method !== "POST" || (path !== "/commit" && path !== "/sign-on" && path !== "/sign")) {
         sendJson(res, 404, { error: `Not found: ${method} ${path}` });
         return;
       }
@@ -299,13 +311,20 @@ export function createFakeNodeServer(node: IdentityNode): http.Server {
         return;
       }
 
-      const request = refreshRequestFromWire(body.request);
-      const result = node.handleRefresh(
-        body.roundId,
+      // /sign consumes two rounds: the access token's and the refresh token's.
+      if (typeof envelope.refreshRoundId !== "string" || envelope.refreshRoundId.length === 0) {
+        throw new Error("body.refreshRoundId must be a non-empty string");
+      }
+      const request = signRequestFromWire(body.request);
+      const result = node.handleSign(
+        { accessRoundId: body.roundId, refreshRoundId: body.refreshRoundId },
         request,
-        ownCommitment(node.nodeId, request.commitments)
+        {
+          access: ownCommitment(node.nodeId, request.commitments),
+          refresh: ownCommitment(node.nodeId, request.refreshCommitments),
+        }
       );
-      sendJson(res, 200, refreshResponseToWire(result));
+      sendJson(res, 200, signResponseToWire(result));
     } catch (err) {
       sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
     }
@@ -320,8 +339,11 @@ export interface RunningFakeNode {
   close(): Promise<void>;
 }
 
-export async function startFakeNode(fixture: string): Promise<RunningFakeNode> {
-  const node = buildNodeFromFixture(fixture);
+export async function startFakeNode(
+  fixture: string,
+  issuer: string = TEST_ISSUER
+): Promise<RunningFakeNode> {
+  const node = buildNodeFromFixture(fixture, issuer);
   const server = createFakeNodeServer(node);
 
   await new Promise<void>((resolve, reject) => {
@@ -347,10 +369,10 @@ export async function startFakeNode(fixture: string): Promise<RunningFakeNode> {
   };
 }
 
-export async function startFakeNodes(): Promise<RunningFakeNode[]> {
+export async function startFakeNodes(issuer: string = TEST_ISSUER): Promise<RunningFakeNode[]> {
   return Promise.all([
-    startFakeNode("node-1.json"),
-    startFakeNode("node-2.json"),
-    startFakeNode("node-3.json"),
+    startFakeNode("node-1.json", issuer),
+    startFakeNode("node-2.json", issuer),
+    startFakeNode("node-3.json", issuer),
   ]);
 }

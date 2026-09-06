@@ -1,16 +1,26 @@
+import crypto from "node:crypto";
 import http from "node:http";
 import url from "node:url";
-import { renderDemoRpCallbackPage } from "./demo-callback.js";
+import { verifyDPoPProof } from "./client-sdk/dpop.js";
 import { DemoLog, createDemoLog } from "./demolog.js";
 import { OidcEndpointHandler } from "./gateway/oidc.js";
-import { PastaOAuthProxy, QuorumError } from "./gateway/proxy.js";
-import { refreshResultToWire, signOnResultToWire } from "./gateway/wire.js";
-import { verifyJwt } from "./jwt/jwt.js";
+import {
+  InvalidCredentialError,
+  PastaOAuthProxy,
+  ProxyTokenResult,
+  QuorumError,
+  decodeCredentialClaims,
+} from "./gateway/proxy.js";
+import { signOnResultToWire } from "./gateway/wire.js";
 import { HttpNodeClient } from "./nodes/http-node-client.js";
+import { Grant } from "./protocol/types.js";
 import { lookupStatic } from "./static.js";
 
 /** Largest request body the gateway accepts, in bytes. Matches the monolith. */
 export const MAX_BODY_BYTES = 1e6;
+
+/** Default RP origin allowed to call `/token` and `/jwks.json` cross-origin (section 14.4). */
+export const DEFAULT_RP_ORIGIN = "http://localhost:3001";
 
 export interface GatewayDeps {
   issuer: string;
@@ -22,6 +32,8 @@ export interface GatewayDeps {
   nodes: HttpNodeClient[];
   /** Directory holding the built demo UI. */
   demoDist: string;
+  /** Origin allowed to call `/token` and `/jwks.json` (section 14.4). */
+  rpOrigin?: string;
   /** Demo log (`docs/container-split.md` section 10). Defaults to the process-wide one. */
   demoLog?: DemoLog;
 }
@@ -185,29 +197,141 @@ function requireField(body: unknown, field: string): string {
 }
 
 /**
+ * Reads `scope`, which reaches the assertion payload but may legitimately be empty.
+ *
+ * An absent scope becomes `""`; a non-string is refused, because the reference
+ * `deterministicJsonStringify` would otherwise write `"scope":undefined` into the payload
+ * (`jwt.ts` is frozen, so the gateway guards the door instead, as with `nonce`).
+ */
+function requireScope(body: unknown): string {
+  const value = (body as Record<string, unknown> | null | undefined)?.["scope"];
+  if (value === undefined) {
+    return "";
+  }
+  if (typeof value !== "string") {
+    throw new BadRequestBodyError(`scope must be a string, got ${value === null ? "null" : typeof value}`);
+  }
+  return value;
+}
+
+/** An OAuth `/token` error carrying the RFC 6749 code and the HTTP status to answer with. */
+export class TokenError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string
+  ) {
+    super(message);
+    this.name = "TokenError";
+  }
+}
+
+/**
+ * The body of `POST /token` (section 14).
+ *
+ * Reads the grant, the DPoP proof from the header, and the credential the grant names.
+ * The gateway's own check is the "proof key equals credential `cnf.jkt`" double defence
+ * (section 14.2); the nodes verify everything else, each for itself. The credential and
+ * the proof are then relayed to `handleSign`, which runs the two FROST rounds and
+ * synthesises the two tokens.
+ */
+async function handleToken(
+  proxy: PastaOAuthProxy,
+  form: Record<string, string>,
+  dpopHeader: string | string[] | undefined,
+  tokenEndpoint: string
+): Promise<ProxyTokenResult> {
+  const grantType = form.grant_type;
+  if (grantType !== "authorization_code" && grantType !== "refresh_token") {
+    throw new TokenError(
+      400,
+      "unsupported_grant_type",
+      `grant_type ${JSON.stringify(grantType ?? "")} is not supported`
+    );
+  }
+  const grant: Grant = grantType;
+
+  const proof =
+    typeof dpopHeader === "string"
+      ? dpopHeader
+      : Array.isArray(dpopHeader)
+        ? dpopHeader[0]
+        : undefined;
+  if (!proof) {
+    throw new TokenError(400, "invalid_dpop_proof", "a DPoP header is required");
+  }
+
+  const credential = grant === "authorization_code" ? form.code : form.refresh_token;
+  if (!credential) {
+    throw new TokenError(
+      400,
+      "invalid_request",
+      grant === "authorization_code" ? "code is required" : "refresh_token is required"
+    );
+  }
+
+  let jkt: string;
+  try {
+    jkt = decodeCredentialClaims(credential).cnf.jkt;
+  } catch (err) {
+    throw new TokenError(400, "invalid_grant", errorMessage(err));
+  }
+
+  const verification = verifyDPoPProof(proof, {
+    expectedHtm: "POST",
+    expectedHtu: tokenEndpoint,
+    expectedJkt: jkt,
+    maxAgeSeconds: 60,
+  });
+  if (!verification.valid) {
+    throw new TokenError(400, "invalid_dpop_proof", verification.error ?? "invalid DPoP proof");
+  }
+
+  try {
+    return await proxy.handleSign(grant, credential, proof);
+  } catch (err) {
+    // The nodes rejected the credential or the proof, or a quorum could not form. Either
+    // way the caller cannot mint a token with what it presented: an invalid grant.
+    throw new TokenError(400, "invalid_grant", errorMessage(err));
+  }
+}
+
+/** Maps a `/token` failure to its status and RFC 6749 error body. */
+function tokenError(err: unknown): { status: number; error: string; description: string } {
+  if (err instanceof TokenError) {
+    return { status: err.status, error: err.code, description: err.message };
+  }
+  if (err instanceof InvalidCredentialError) {
+    return { status: 400, error: "invalid_grant", description: err.message };
+  }
+  return { status: 400, error: "invalid_request", description: errorMessage(err) };
+}
+
+/**
  * Builds the gateway's HTTP server without binding a port, so callers (and tests) decide
  * where it listens.
  *
- * Routes (`docs/container-split.md` section 6):
+ * Routes (`docs/container-split.md` sections 6 and 14):
  *   GET  /.well-known/openid-configuration
  *   GET  /jwks.json
- *   GET  /authorize
+ *   GET  /authorize            (response_type=code)
  *   POST /api/pasta/sign-on
- *   POST /api/pasta/refresh
- *   POST /demo/rp-callback
+ *   POST /token                (authorization_code / refresh_token grants)
  *   GET  /, /demo, /assets/*
  *   GET  /health
  *
- * Ported from the monolith's `src/bin/gateway.ts`. The `/rp` and `/rp/callback` routes
- * are gone: they are the `rp` component now (section 7), and `/api/pasta/browser-sign-on`
- * is gone with them (section 11). That route ran the client SDK inside the gateway, which
- * meant handing the gateway a plaintext password -- exactly the thing the architecture
- * claims it never sees. The SDK now runs in the browser (`projects/demo`), so nothing
- * here accepts a password, and a request that carries one is not read for it: sign-on
- * takes `username` and `blinded` and nothing else off the body.
+ * Ported from the monolith's `src/bin/gateway.ts`, then reshaped for OAuth (section 14).
+ * The id_token flow is gone: `/authorize` issues a `code` (the assertion), and `/token`
+ * exchanges it, with the DPoP proof and the credential relayed to the nodes. `/rp`,
+ * `/rp/callback`, `/api/pasta/browser-sign-on`, `/api/pasta/refresh` and `/demo/rp-callback`
+ * are all gone. The gateway holds no user state: sign-on takes `username` and `blinded`
+ * and nothing else off the body, and `/token` keeps neither the code nor the refresh
+ * token it relays.
  */
 export function createGatewayServer(deps: GatewayDeps): http.Server {
   const demoLog = deps.demoLog ?? createDemoLog();
+  const rpOrigin = deps.rpOrigin ?? DEFAULT_RP_ORIGIN;
+  const tokenEndpoint = `${deps.issuer.replace(/\/+$/, "")}/token`;
   const oidc = new OidcEndpointHandler({
     issuer: deps.issuer,
     groupPublicKey: deps.groupPublicKey,
@@ -219,10 +343,21 @@ export function createGatewayServer(deps: GatewayDeps): http.Server {
     const pathname = reqUrl.pathname;
     const method = req.method || "GET";
 
-    // CORS headers
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, DPoP, Authorization");
+    // CORS. `/token` and `/jwks.json` are called cross-origin by the RP front end, which
+    // sends a non-simple `DPoP` header, so their preflight must name it. They are pinned
+    // to the RP origin (section 14.4); every other route keeps the permissive default.
+    if (pathname === "/token") {
+      res.setHeader("Access-Control-Allow-Origin", rpOrigin);
+      res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "DPoP, Content-Type");
+    } else if (pathname === "/jwks.json") {
+      res.setHeader("Access-Control-Allow-Origin", rpOrigin);
+      res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    } else {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, DPoP, Authorization");
+    }
 
     if (method === "OPTIONS") {
       res.writeHead(204);
@@ -282,27 +417,41 @@ export function createGatewayServer(deps: GatewayDeps): http.Server {
           return;
         }
 
+        // The challenge `c` becomes the assertion's nonce and limits its replay window.
+        // The gateway generates it and forgets it: nothing here is stored (section 14.1).
+        const challenge = crypto.randomUUID();
+
         demoLog.authorize({
           clientId: validation.params.clientId,
           redirectUri: validation.params.redirectUri,
-          nonce: validation.params.nonce,
+          nonce: challenge,
           state: validation.params.state,
           dpopJkt: validation.params.dpopJkt,
         });
 
-        const html = oidc.renderAuthorizePage(validation.params);
+        const html = oidc.renderAuthorizePage({ ...validation.params, challenge });
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         res.end(html);
         return;
       }
 
-      // 4. Proxy Sign-On Endpoint (Hole 2: Proxy only relays blinded ciphertext shares)
+      // 4. Proxy Sign-On Endpoint. The gateway relays blinded ciphertext shares; it holds
+      // no password and no session. The assertion the client assembles is the code.
       if (method === "POST" && pathname === "/api/pasta/sign-on") {
         const body = await readJsonBody(req);
         let result;
         try {
-          requireField(body, "nonce");
-          result = await deps.proxy.handleSignOn(body);
+          // Both `nonce` (the authorize challenge `c`) and `clientId` reach the assertion
+          // payload; the reference `deterministicJsonStringify` writes an absent one out
+          // as `"...":undefined`, unparseable JSON, so the gateway refuses it at the door
+          // (section 6). `scope` may be empty but must be a string.
+          const signOnBody = {
+            ...body,
+            clientId: requireField(body, "clientId"),
+            nonce: requireField(body, "nonce"),
+            scope: requireScope(body),
+          };
+          result = await deps.proxy.handleSignOn(signOnBody);
         } catch (err) {
           // The successful event is logged by the proxy, which is the only place that
           // knows which nodes were excluded from the round.
@@ -317,47 +466,37 @@ export function createGatewayServer(deps: GatewayDeps): http.Server {
         return;
       }
 
-      // 5. Proxy Refresh Endpoint (Hole 5: Nodes verify DPoP proof independently)
-      if (method === "POST" && pathname === "/api/pasta/refresh") {
-        const body = await readJsonBody(req);
-        let result;
+      // 5. Token Endpoint (section 14). Exchanges a code (assertion) or a refresh token,
+      // presented with a DPoP proof, for an access token and the next refresh token.
+      if (method === "POST" && pathname === "/token") {
+        const form = await readUrlEncodedBody(req);
         try {
-          requireField(body, "nonce");
-          result = await deps.proxy.handleRefresh(body);
+          const { accessToken, refreshToken, expiresIn, scope } = await handleToken(
+            deps.proxy,
+            form,
+            req.headers["dpop"],
+            tokenEndpoint
+          );
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(
+            JSON.stringify({
+              access_token: accessToken,
+              token_type: "DPoP",
+              expires_in: expiresIn,
+              refresh_token: refreshToken,
+              scope,
+            })
+          );
         } catch (err) {
-          demoLog.reject("refresh", rejectReason(err));
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: errorMessage(err) }));
-          return;
+          const { status, error, description } = tokenError(err);
+          demoLog.reject("token", `${error}: ${description}`);
+          res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({ error, error_description: description }));
         }
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(refreshResultToWire(result)));
         return;
       }
 
-      // 6. Demo Relying Party (RP) form_post Callback Endpoint
-      if (method === "POST" && pathname === "/demo/rp-callback") {
-        const formParams = await readUrlEncodedBody(req);
-        const idToken = formParams.id_token;
-
-        if (!idToken) {
-          demoLog.reject("rp-demo", "no id_token in the form_post body");
-          res.writeHead(400, { "Content-Type": "text/html" });
-          res.end("<h1>400 Bad Request: Missing id_token</h1>");
-          return;
-        }
-
-        // The stand-in RP verifies the Ed25519 token the way any RP would. The page
-        // escapes every value it echoes; see `demo-callback.ts`.
-        const verifyRes = verifyJwt(idToken, deps.groupPublicKey, { iss: deps.issuer });
-        demoLog.demoRpCallback({ idToken, verified: verifyRes.valid });
-
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        res.end(renderDemoRpCallbackPage(verifyRes, formParams.state));
-        return;
-      }
-
-      // 7. Serve React Web Demo UI
+      // 6. Serve React Web Demo UI
       if (method === "GET" || method === "HEAD") {
         const lookup = lookupStatic(deps.demoDist, pathname);
         if (lookup.kind === "forbidden") {

@@ -121,12 +121,17 @@ describe("OIDC Gateway Endpoints (Holes 2 & 4)", () => {
     groupPublicKey,
   });
 
-  it("exposes discovery configuration declaring response_modes_supported=['form_post']", () => {
+  it("exposes an OAuth authorization-code discovery document (section 14)", () => {
     const config = oidc.getDiscoveryConfiguration() as any;
     expect(config.issuer).toBe("https://idp.example.com");
-    expect(config.response_modes_supported).toContain("form_post");
-    expect(config.id_token_signing_alg_values_supported).toContain("EdDSA");
+    expect(config.response_types_supported).toEqual(["code"]);
+    expect(config.grant_types_supported).toEqual(["authorization_code", "refresh_token"]);
+    expect(config.token_endpoint).toBe("https://idp.example.com/token");
     expect(config.dpop_signing_alg_values_supported).toContain("EdDSA");
+    expect(config.token_endpoint_auth_methods_supported).toEqual(["none"]);
+    // The id_token flow is gone: no response modes, no id_token signing algs.
+    expect(config.response_modes_supported).toBeUndefined();
+    expect(config.id_token_signing_alg_values_supported).toBeUndefined();
   });
 
   it("publishes group public key via standard Ed25519 JWKS (RFC 8037)", () => {
@@ -138,40 +143,35 @@ describe("OIDC Gateway Endpoints (Holes 2 & 4)", () => {
     expect(typeof jwks.keys[0].x).toBe("string");
   });
 
-  it("enforces response_mode=form_post at /authorize", () => {
+  it("accepts response_type=code and refuses anything else (section 14)", () => {
     const valid = oidc.validateAuthorizeRequest({
       client_id: "test_client",
       redirect_uri: "https://rp.example.com/cb",
-      response_type: "id_token",
-      response_mode: "form_post",
+      response_type: "code",
       scope: "openid profile",
-      nonce: "nonce123",
       dpop_jkt: RP_JKT,
     });
     expect(valid.valid).toBe(true);
     expect(valid.params?.dpopJkt).toBe(RP_JKT);
+    expect(valid.params?.responseType).toBe("code");
 
-    const invalidMode = oidc.validateAuthorizeRequest({
+    const idTokenFlow = oidc.validateAuthorizeRequest({
       client_id: "test_client",
       redirect_uri: "https://rp.example.com/cb",
-      response_type: "id_token",
-      response_mode: "query", // invalid: proxy cannot hold tokens (Hole 2)
+      response_type: "id_token", // the id_token flow is gone
       scope: "openid",
-      nonce: "nonce123",
       dpop_jkt: RP_JKT,
     });
-    expect(invalidMode.valid).toBe(false);
-    expect(invalidMode.error).toContain("only 'form_post' is supported");
+    expect(idTokenFlow.valid).toBe(false);
+    expect(idTokenFlow.error).toContain("only 'code' is supported");
   });
 
   describe("dpop_jkt (docs/container-split.md section 13)", () => {
     const base = {
       client_id: "test_client",
       redirect_uri: "https://rp.example.com/cb",
-      response_type: "id_token",
-      response_mode: "form_post",
+      response_type: "code",
       scope: "openid",
-      nonce: "nonce123",
     };
 
     it("requires it, because the RP front end owns the DPoP key", () => {
@@ -196,16 +196,17 @@ describe("OIDC Gateway Endpoints (Holes 2 & 4)", () => {
       }
     });
 
-    it("carries the thumbprint through to the demo URL verbatim", () => {
+    it("carries the thumbprint and the challenge through to the demo URL verbatim", () => {
       const html = oidc.renderAuthorizePage({
         clientId: "test_client",
         redirectUri: "https://rp.example.com/cb",
-        nonce: "nonce123",
         state: "st",
         scope: "openid",
         dpopJkt: RP_JKT,
+        challenge: "c-abc123",
       });
       expect(html).toContain(`dpop_jkt=${RP_JKT}`);
+      expect(html).toContain("c=c-abc123");
     });
   });
 });

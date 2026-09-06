@@ -1,15 +1,15 @@
 import { FrostCommitment } from "../crypto/frost.js";
 import { base64UrlDecode, base64UrlEncode } from "../jwt/jwt.js";
-import { ProxyRefreshResult, ProxySignOnResult } from "./proxy.js";
+import { ProxySignOnResult } from "./proxy.js";
 
 /**
- * Wire form of the browser-facing proxy results (`docs/container-split.md` section 3).
+ * Wire form of the browser-facing sign-on result (`docs/container-split.md` section 3).
  *
  * `PastaOAuthProxy` works in the in-process shapes, where a FROST commitment carries raw
  * `Uint8Array` points. Those must not reach JSON: the monolith serialised them directly
  * and produced `{"0":12,"1":240,...}`, which no client can turn back into a point. Every
- * byte string leaving `/api/pasta/sign-on` and `/api/pasta/refresh` is therefore
- * base64url without padding, and the client SDK decodes it back on arrival.
+ * byte string leaving `/api/pasta/sign-on` is therefore base64url without padding, and
+ * the client decodes it back on arrival.
  *
  * Field names are unchanged from the monolith, as section 6 requires.
  */
@@ -29,18 +29,6 @@ export interface ProxySignOnResultWire {
     toprfPartial: string;
     ct_i: string;
     sessionId: string;
-    sub: string;
-  }>;
-}
-
-export interface ProxyRefreshResultWire {
-  sessionId: string;
-  commitments: CommitmentWire[];
-  nodeResponses: Array<{
-    nodeId: number;
-    commitment: { D: string; E: string };
-    ct_i: string;
-    ctr: number;
     sub: string;
   }>;
 }
@@ -84,40 +72,6 @@ export function signOnResultFromWire(wire: ProxySignOnResultWire): ProxySignOnRe
       toprfPartial: r.toprfPartial,
       ct_i: r.ct_i,
       sessionId: r.sessionId,
-      sub: r.sub,
-    })),
-  };
-}
-
-export function refreshResultToWire(result: ProxyRefreshResult): ProxyRefreshResultWire {
-  return {
-    sessionId: result.sessionId,
-    commitments: result.commitments.map(commitmentToWire),
-    nodeResponses: result.nodeResponses.map((r) => ({
-      nodeId: r.nodeId,
-      commitment: {
-        D: base64UrlEncode(r.commitment.D),
-        E: base64UrlEncode(r.commitment.E),
-      },
-      ct_i: r.ct_i,
-      ctr: r.ctr,
-      sub: r.sub,
-    })),
-  };
-}
-
-export function refreshResultFromWire(wire: ProxyRefreshResultWire): ProxyRefreshResult {
-  return {
-    sessionId: wire.sessionId,
-    commitments: wire.commitments.map(commitmentFromWire),
-    nodeResponses: wire.nodeResponses.map((r) => ({
-      nodeId: r.nodeId,
-      commitment: {
-        D: base64UrlDecode(r.commitment.D),
-        E: base64UrlDecode(r.commitment.E),
-      },
-      ct_i: r.ct_i,
-      ctr: r.ctr,
       sub: r.sub,
     })),
   };

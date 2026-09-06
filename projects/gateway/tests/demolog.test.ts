@@ -39,6 +39,15 @@ const SIGN_ON = {
   excluded: [],
 };
 
+const TOKEN = {
+  grant: "authorization_code" as const,
+  credential: "eyJhbGciOiJFZERTQSJ9.assertion.sig",
+  accessToken: "eyJhbGciOiJhdCtqd3QifQ.claims.sig",
+  cnfJkt: "vfiOlS-Fabcdefgh",
+  participants: [1, 2, 3],
+  excluded: [],
+};
+
 /** A real RFC 7638 thumbprint: SHA-256, base64url, 43 characters (section 13). */
 const RP_JKT = "b0JFnFHOoQOqFk3sGvEnW6tC8VOBT9NIXtYjIrhAHTA";
 
@@ -70,16 +79,9 @@ describe("DEMO_LOG", () => {
       dpopJkt: RP_JKT,
     });
     log.signOn(SIGN_ON);
-    log.refresh({
-      sessionId: SIGN_ON.sessionId,
-      roundId: SIGN_ON.roundId,
-      participants: [1, 2],
-      dpopProof: "eyJhbGciOi",
-      excluded: [],
-    });
+    log.token(TOKEN);
     log.jwks();
     log.discovery();
-    log.demoRpCallback({ idToken: "eyJhbGciOi", verified: true });
     log.reject("sign-on", "nope");
 
     expect(lines).toEqual([]);
@@ -188,23 +190,33 @@ describe("event wording", () => {
     expect(lines.join("\n")).not.toContain("http://node3:4003/commit");
   });
 
-  it("prints a refresh on one line", () => {
+  it("prints a token exchange on one line, showing the access token but no password", () => {
     const { log, lines } = capture();
-    log.refresh({
-      sessionId: SIGN_ON.sessionId,
-      roundId: SIGN_ON.roundId,
-      participants: [1, 2],
-      dpopProof: "eyJhbGciOiJFZERTQSJ9.abc",
-      excluded: [],
-    });
+    log.token(TOKEN);
 
     expect(lines).toEqual([
-      "[gateway] refresh   sess=2b4e8c32 round=c1b3762a  ← DPoP eyJhbGci (verified by nodes)  " +
-        "→ ct_i×2 relayed",
+      "[gateway] token     grant=authz  ← code(assertion) eyJhbGci + DPoP ✓  " +
+        "→ 2×/commit ×3 → /sign → access_token eyJhbGciOiJhdCtq (cnf.jkt=vfiOlS-F) + refresh_token",
     ]);
   });
 
-  it("prints authorize, the public endpoints and the demo callback", () => {
+  it("labels a refresh grant and names any dropped node on a token event", () => {
+    const { log, lines } = capture();
+    log.token({
+      ...TOKEN,
+      grant: "refresh_token",
+      participants: [1, 2],
+      excluded: [{ nodeId: 3, reason: "Node 3 at http://node3:4003/commit unreachable" }],
+    });
+
+    expect(lines[0]).toContain("grant=refresh");
+    expect(lines[0]).toContain("refresh_token eyJhbGci");
+    expect(lines[0]).toContain("(node3 unreachable, excluded)");
+    expect(lines[0]).toContain("2×/commit ×2");
+    expect(lines.join("\n")).not.toContain("http://node3:4003/commit");
+  });
+
+  it("prints authorize and the public endpoints", () => {
     const { log, lines } = capture();
     log.authorize({
       clientId: "demo_client",
@@ -215,14 +227,12 @@ describe("event wording", () => {
     });
     log.jwks();
     log.discovery();
-    log.demoRpCallback({ idToken: "eyJhbGciOiJFZERTQSJ9.e30.AAAA", verified: false });
 
     expect(lines).toEqual([
       "[gateway] authorize client_id=demo_client nonce=n-abcdefghijkl state=st-1 " +
         `dpop_jkt=${RP_JKT.slice(0, 8)}  → redirect /demo`,
       "[gateway] jwks      public only",
       "[gateway] discovery public only",
-      "[gateway] rp-demo   ← id_token eyJhbGci  → Ed25519 ✗  (demo-only callback page)",
     ]);
   });
 
@@ -265,17 +275,10 @@ describe("event wording", () => {
     // it once per column instead of on every event.
     const { log, lines } = capture();
     log.signOn(SIGN_ON);
-    log.refresh({
-      sessionId: SIGN_ON.sessionId,
-      roundId: SIGN_ON.roundId,
-      participants: [1, 2, 3],
-      dpopProof: "proof",
-      excluded: [],
-    });
-    log.demoRpCallback({ idToken: "tok", verified: true });
+    log.token(TOKEN);
 
     expect(lines.filter((l) => l.includes("never:"))).toHaveLength(0);
-    expect(NEVER_HELD).toBe("s_i, k_i, h_i, pw, id_token");
+    expect(NEVER_HELD).toBe("s_i, k_i, h_i, pw");
   });
 
   it("keeps every event's first line in the same two columns", () => {
@@ -295,9 +298,9 @@ describe("event wording", () => {
       dpopJkt: RP_JKT,
     });
     log.signOn(SIGN_ON);
+    log.token(TOKEN);
     log.jwks();
     log.discovery();
-    log.demoRpCallback({ idToken: "tok", verified: true });
 
     for (const line of lines.filter((l) => l.startsWith("[gateway]"))) {
       expect(line.slice(0, CONTINUATION_INDENT.length)).toMatch(/^\[gateway\] \S.{0,8} *$/);

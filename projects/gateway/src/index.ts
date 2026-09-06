@@ -8,6 +8,7 @@ const DEFAULT_PORT = 3000;
 const DEFAULT_GROUP_CONFIG = "/secrets/group.json";
 const DEFAULT_NODE_URLS = "http://localhost:4001,http://localhost:4002,http://localhost:4003";
 const DEFAULT_DEMO_DIST = "/app/ui";
+const DEFAULT_RP_ORIGIN = "http://localhost:3001";
 /** The `kid` the copied client SDK writes into every JWT header. */
 const SDK_KEY_ID = "pasta-group-key-1";
 const SHUTDOWN_GRACE_MS = 10_000;
@@ -39,6 +40,7 @@ async function main(): Promise<void> {
   const issuer = (process.env.ISSUER || `http://localhost:${port}`).replace(/\/+$/, "");
   const groupConfigPath = process.env.GROUP_CONFIG || DEFAULT_GROUP_CONFIG;
   const demoDist = process.env.DEMO_DIST || DEFAULT_DEMO_DIST;
+  const rpOrigin = (process.env.RP_ORIGIN || DEFAULT_RP_ORIGIN).replace(/\/+$/, "");
   const nodeUrls = parseNodeUrls(process.env.NODE_URLS || DEFAULT_NODE_URLS);
 
   const group = loadGroupConfig(groupConfigPath);
@@ -58,6 +60,7 @@ async function main(): Promise<void> {
   }
   console.log(`[gateway] groupPublicKey=${bytesToHex(group.groupPublicKey)}`);
   console.log(`[gateway] nodes=${nodeUrls.join(", ")}`);
+  console.log(`[gateway] rpOrigin=${rpOrigin}`);
 
   // Positions in NODE_URLS say nothing about identity; each node reports its own id.
   const nodes = await discoverNodes({
@@ -78,7 +81,7 @@ async function main(): Promise<void> {
     nodeUrls: nodes.map((n) => n.url),
   });
 
-  const proxy = new PastaOAuthProxy(nodes, threshold, undefined, demoLog);
+  const proxy = new PastaOAuthProxy(nodes, threshold, demoLog, issuer, group.keyId);
   const server = createGatewayServer({
     issuer,
     threshold,
@@ -87,6 +90,7 @@ async function main(): Promise<void> {
     proxy,
     nodes,
     demoDist,
+    rpOrigin,
     demoLog,
   });
 

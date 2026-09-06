@@ -1,19 +1,21 @@
 import { FrostCommitment } from "../crypto/frost.js";
 import { base64UrlDecode, base64UrlEncode } from "../jwt/jwt.js";
 import {
-  RefreshRequest,
-  RefreshResponse,
   SignOnRequest,
   SignOnResponse,
+  SignRequest,
+  SignResponse,
 } from "../protocol/types.js";
 
 /**
- * Wire types and codecs for the node API (`docs/container-split.md` sections 3 and 5).
+ * Wire types and codecs for the node API (`docs/container-split.md` sections 3, 5 and 14).
  *
  * A `Uint8Array` never travels inside JSON. Every byte string on the wire is base64url
  * without padding, produced by the `base64UrlEncode` / `base64UrlDecode` of
  * `jwt/jwt.ts`. The fields that were already base64url strings in the in-process types
- * (`blinded`, `sessionNonce`, `toprfPartial`, `ct_i`) pass through untouched.
+ * (`blinded`, `sessionNonce`, `toprfPartial`, `ct_i`) pass through untouched. A FROST
+ * signature share `z_i` is a scalar: 64 lowercase hex digits, big-endian, read back with
+ * `BigInt("0x" + hex)`.
  *
  * These declarations mirror `node/src/wire.ts`. They are re-declared rather than shared:
  * the two projects are independent by contract (section 1), and this file carries only
@@ -38,10 +40,11 @@ export interface SignOnRequestWire {
   blinded: string;
   sessionNonce: string;
   cnfJkt: string;
+  clientId: string;
+  scope: string;
   nonce?: string;
   iat: number;
   exp: number;
-  aud: string;
   iss: string;
   commitments: CommitmentWire[];
   allParticipants: number[];
@@ -56,25 +59,33 @@ export interface SignOnResponseWire {
   sub: string;
 }
 
-export interface RefreshRequestWire {
-  sessionId: string;
-  dpopProof: string;
-  expectedHtu: string;
-  nonce?: string;
+export interface AccessTokenClaimsWire {
   iat: number;
   exp: number;
-  aud: string;
-  iss: string;
+  jti: string;
+}
+
+export interface SignRequestWire {
+  grant: "authorization_code" | "refresh_token";
+  assertion?: string;
+  refreshToken?: string;
+  dpopProof: string;
+  claims: AccessTokenClaimsWire;
+  refreshExp?: number;
   commitments: CommitmentWire[];
+  refreshCommitments: CommitmentWire[];
   allParticipants: number[];
 }
 
-export interface RefreshResponseWire {
-  nodeId: number;
+export interface SignedShareWire {
   commitment: { D: string; E: string };
-  ct_i: string;
-  ctr: number;
-  sub: string;
+  z_i: string; // 64 lowercase hex digits, big-endian
+}
+
+export interface SignResponseWire {
+  nodeId: number;
+  at: SignedShareWire;
+  rt: SignedShareWire;
 }
 
 export interface HealthResponseWire {
@@ -129,6 +140,15 @@ export function decodePoint(where: string, value: unknown, byteLength = 32): Uin
   return bytes;
 }
 
+/** 64 lowercase hex digits -> scalar (`BigInt("0x" + hex)`), the section 3 convention. */
+export function decodeScalar(where: string, value: unknown): bigint {
+  const s = requireNonEmptyString(where, value);
+  if (!/^[0-9a-f]{64}$/.test(s)) {
+    throw new NodeWireError(`${where} must be 64 lowercase hex digits`);
+  }
+  return BigInt("0x" + s);
+}
+
 export function commitmentToWire(commitment: FrostCommitment): CommitmentWire {
   return {
     nodeId: commitment.nodeId,
@@ -138,7 +158,7 @@ export function commitmentToWire(commitment: FrostCommitment): CommitmentWire {
 }
 
 /**
- * Encodes the one optional field of a round-2 request.
+ * Encodes the one optional field of the sign-on request.
  *
  * `nonce` is left off the wire entirely when the caller omitted it, so that `"nonce" in
  * req` stays false on the node and the payload it signs matches the one the client built.
@@ -166,9 +186,10 @@ export function signOnRequestToWire(req: SignOnRequest): SignOnRequestWire {
     blinded: req.blinded,
     sessionNonce: req.sessionNonce,
     cnfJkt: req.cnfJkt,
+    clientId: req.clientId,
+    scope: req.scope,
     iat: req.iat,
     exp: req.exp,
-    aud: req.aud,
     iss: req.iss,
     commitments: req.commitments.map(commitmentToWire),
     allParticipants: [...req.allParticipants],
@@ -180,21 +201,24 @@ export function signOnRequestToWire(req: SignOnRequest): SignOnRequestWire {
   return wire;
 }
 
-export function refreshRequestToWire(req: RefreshRequest): RefreshRequestWire {
-  const wire: RefreshRequestWire = {
-    sessionId: req.sessionId,
+export function signRequestToWire(req: SignRequest): SignRequestWire {
+  const wire: SignRequestWire = {
+    grant: req.grant,
     dpopProof: req.dpopProof,
-    expectedHtu: req.expectedHtu,
-    iat: req.iat,
-    exp: req.exp,
-    aud: req.aud,
-    iss: req.iss,
+    claims: { iat: req.claims.iat, exp: req.claims.exp, jti: req.claims.jti },
     commitments: req.commitments.map(commitmentToWire),
+    refreshCommitments: req.refreshCommitments.map(commitmentToWire),
     allParticipants: [...req.allParticipants],
   };
-  const nonce = nonceToWire("request", req.nonce);
-  if (nonce !== undefined) {
-    wire.nonce = nonce;
+  // Only the credential the grant names travels: the node reads exactly one, and a body
+  // carrying both is not a way to choose which gets verified (node README section 14).
+  if (req.grant === "authorization_code") {
+    wire.assertion = req.assertion;
+  } else {
+    wire.refreshToken = req.refreshToken;
+  }
+  if (req.refreshExp !== undefined) {
+    wire.refreshExp = req.refreshExp;
   }
   return wire;
 }
@@ -224,18 +248,24 @@ export function signOnResponseFromWire(value: unknown, where = "response"): Sign
   };
 }
 
-export function refreshResponseFromWire(value: unknown, where = "response"): RefreshResponse {
+function signedShareFromWire(value: unknown, where: string) {
   const raw = requireObject(where, value);
   const commitment = requireObject(`${where}.commitment`, raw.commitment);
   return {
-    nodeId: requireInteger(`${where}.nodeId`, raw.nodeId),
     commitment: {
       D: decodePoint(`${where}.commitment.D`, commitment.D),
       E: decodePoint(`${where}.commitment.E`, commitment.E),
     },
-    ct_i: requireNonEmptyString(`${where}.ct_i`, raw.ct_i),
-    ctr: requireInteger(`${where}.ctr`, raw.ctr),
-    sub: requireNonEmptyString(`${where}.sub`, raw.sub),
+    z_i: decodeScalar(`${where}.z_i`, raw.z_i),
+  };
+}
+
+export function signResponseFromWire(value: unknown, where = "response"): SignResponse {
+  const raw = requireObject(where, value);
+  return {
+    nodeId: requireInteger(`${where}.nodeId`, raw.nodeId),
+    at: signedShareFromWire(raw.at, `${where}.at`),
+    rt: signedShareFromWire(raw.rt, `${where}.rt`),
   };
 }
 

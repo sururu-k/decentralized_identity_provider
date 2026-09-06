@@ -38,7 +38,7 @@ export interface DemoLogOptions {
  * The `never:` text of the `● up` line. A constant on purpose (section 10): the audience
  * compares it across columns, and it is the only place the claim is made.
  */
-export const NEVER_HELD = "s_i, k_i, h_i, pw, id_token";
+export const NEVER_HELD = "s_i, k_i, h_i, pw";
 
 /** How many characters of a per-session value are shown. */
 export const VALUE_PREFIX_LENGTH = 8;
@@ -54,8 +54,8 @@ export const CONTINUATION_INDENT = " ".repeat(TAG_WIDTH + 1 + EVENT_WIDTH + 1);
  * Cuts a base64url value to its first 8 characters, with no ellipsis (section 10).
  *
  * Only ever called on values that are safe to show in part: the blinded point `A`, a
- * `cnf.jkt` thumbprint, a DPoP proof, a finished `id_token`, an id. The gateway holds no
- * long-term secret of its own, so nothing that would be unsafe even truncated can reach
+ * `cnf.jkt` thumbprint, a credential or token bound to `cnf.jkt`, an id. The gateway holds
+ * no long-term secret of its own, so nothing that would be unsafe even truncated can reach
  * this function.
  */
 export function shortValue(value: string | undefined): string {
@@ -137,20 +137,16 @@ export interface SignOnInfo {
   password?: never;
 }
 
-export interface RefreshInfo {
-  sessionId: string;
-  roundId: string;
+export interface TokenInfo {
+  /** Which credential the client spent. */
+  grant: "authorization_code" | "refresh_token";
+  /** The credential (assertion or refresh token). Shown as its first 8 characters. */
+  credential: string;
+  /** The synthesised access token. Bound to `cnf.jkt`, so shown as its first 16. */
+  accessToken: string;
+  cnfJkt: string;
   participants: number[];
-  /** The DPoP proof, relayed untouched. Only the nodes verify it. */
-  dpopProof: string;
   excluded: ExcludedNode[];
-  password?: never;
-}
-
-export interface DemoRpCallbackInfo {
-  idToken: string;
-  /** Whether the stand-in RP's Ed25519 check passed. */
-  verified: boolean;
   password?: never;
 }
 
@@ -160,12 +156,12 @@ export interface DemoLog {
   startup(info: StartupInfo): void;
   authorize(info: AuthorizeInfo): void;
   signOn(info: SignOnInfo): void;
-  refresh(info: RefreshInfo): void;
+  /** `POST /token` — synthesises the access token and next refresh token (section 14). */
+  token(info: TokenInfo): void;
   /** `GET /jwks.json` — public key material only, so a single line. */
   jwks(): void;
   /** `GET /.well-known/openid-configuration` — public metadata only. */
   discovery(): void;
-  demoRpCallback(info: DemoRpCallbackInfo): void;
   /** A refusal, printed as a single `✖` line carrying the reason verbatim. */
   reject(event: string, reason: string): void;
 }
@@ -207,10 +203,9 @@ export function createDemoLog(options: DemoLogOptions = {}): DemoLog {
     startup: () => {},
     authorize: () => {},
     signOn: () => {},
-    refresh: () => {},
+    token: () => {},
     jwks: () => {},
     discovery: () => {},
-    demoRpCallback: () => {},
     reject: () => {},
   };
   if (!enabled) return noop;
@@ -250,13 +245,17 @@ export function createDemoLog(options: DemoLogOptions = {}): DemoLog {
       );
     },
 
-    refresh(info) {
+    token(info) {
+      const grantLabel = info.grant === "authorization_code" ? "authz" : "refresh";
+      const credLabel = info.grant === "authorization_code" ? "code(assertion)" : "refresh_token";
       const n = info.participants.length;
+      // Both synthesised tokens are bound to cnf.jkt, so the access token is safe to show
+      // in part (section 14.2). The credential is a single-use signed value, cut to 8.
       head(
-        "refresh",
-        `sess=${shortId(info.sessionId)} round=${shortId(info.roundId)}  ` +
-          `← DPoP ${shortValue(info.dpopProof)} (verified by nodes)  ` +
-          `→ ct_i×${n} relayed${excludedPhrase(info.excluded)}`
+        "token",
+        `grant=${grantLabel}  ← ${credLabel} ${shortValue(info.credential)} + DPoP ✓` +
+          `${excludedPhrase(info.excluded)}  → 2×/commit ×${n} → /sign → ` +
+          `access_token ${info.accessToken.slice(0, 16)} (cnf.jkt=${shortValue(info.cnfJkt)}) + refresh_token`
       );
     },
 
@@ -266,14 +265,6 @@ export function createDemoLog(options: DemoLogOptions = {}): DemoLog {
 
     discovery() {
       head("discovery", "public only");
-    },
-
-    demoRpCallback(info) {
-      head(
-        "rp-demo",
-        `← id_token ${shortValue(info.idToken)}  → Ed25519 ${info.verified ? "✓" : "✗"}  ` +
-          `(demo-only callback page)`
-      );
     },
 
     reject(event, reason) {
