@@ -11,11 +11,18 @@ import {
   unblind,
 } from "./crypto/toprf.js";
 import { aeadDecrypt, deriveAeadNonce } from "./crypto/aead.js";
-import { deriveRefreshKey } from "./crypto/kdf.js";
 import { assembleJwt, base64UrlDecode, base64UrlEncode, createSigningInput } from "./jwt.js";
-import { ProxySignOnResult, ProxyRefreshResult } from "./types.js";
-import { refreshResultFromWire, signOnResultFromWire } from "./wire.js";
+import { ProxySignOnResult } from "./types.js";
+import { signOnResultFromWire } from "./wire.js";
 import { DemoEventSink, DemoStep, rejectEvent, stepEvent, trunc, truncScalar } from "./events.js";
+
+/**
+ * The authentication assertion lives for this many seconds (docs/container-split.md
+ * section 14): it is the OAuth authorization code, and a node refuses to sign one whose
+ * `exp - iat` exceeds 30. Replay inside the window only yields tokens bound to the same
+ * `cnf.jkt`, useless without the rp front end's DPoP private key.
+ */
+export const ASSERTION_LIFETIME_SECONDS = 30;
 
 export interface ClientAuthConfig {
   /**
@@ -23,6 +30,11 @@ export interface ClientAuthConfig {
    * UI uses: the page is served by the gateway itself.
    */
   proxyUrl: string;
+  /**
+   * The issuer the assertion is signed under, and its `aud`: the assertion is addressed to
+   * the gateway. In the browser this is `window.location.origin`, the same string the
+   * gateway publishes and every node requires.
+   */
   issuer: string;
   /** Optional progress sink for the section 10 demo log. Added by this port. */
   onEvent?: DemoEventSink;
@@ -31,65 +43,63 @@ export interface ClientAuthConfig {
 export interface ClientSignOnOptions {
   username: string;
   password: string;
+  /** OAuth `client_id`; signed into the assertion, and the access token's future `aud`. */
   clientId: string;
+  /** OAuth `scope`; signed into the assertion. May be the empty string. */
+  scope: string;
+  /** The gateway's authorize challenge `c`, signed into the assertion as `nonce`. */
   nonce: string;
   participants?: number[];
-  lifetimeSeconds?: number;
 }
 
-export interface ClientRefreshOptions {
-  clientId: string;
-  nonce?: string;
-  refreshEndpointUrl: string;
-  /**
-   * An RFC 9449 DPoP proof over `POST <refreshEndpointUrl>`, signed with the private key
-   * whose thumbprint is this SDK's `cnfJkt`. The caller makes it: since section 13 the
-   * key belongs to the RP front end, and this SDK never holds one.
-   */
-  dpopProof: string;
-  participants?: number[];
-  lifetimeSeconds?: number;
-}
-
+/**
+ * The only per-session state the browser keeps. Since section 14 there is no refresh on
+ * the IdP front end -- the rp front end refreshes at `/token` with its own DPoP key -- so
+ * there is no `rs_i`, no counter and nothing to store between requests.
+ */
 export interface StoredSession {
   sessionId: string;
   sub: string;
-  nodeSecrets: Map<number, Uint8Array>; // nodeId -> rs_i
-  counter: number;
   cnfJkt: string;
 }
 
 /**
  * Decentralized Client SDK
  *
- * Implements the browser/client-side aggregator from docs/whiteboard-gaps.md & docs/refresh-token.md:
- * 1. Blinds password locally via TOPRF (A = r * H1(pw)) and queries proxy (Hole 2: proxy never sees password, token, or h_i)
- * 2. Unblinds partial evaluations to reconstruct master PRF value h and derive h_i
- * 3. Decrypts ct_i locally using ChaCha20-Poly1305 with h_i
- * 4. Aggregates FROST Ed25519 threshold signature locally
- * 5. Stores session secrets rs_i locally for sender-constrained refresh (Hole 5)
+ * The browser-side aggregator of the PASTA flow (docs/container-split.md section 14). It
+ * turns a password into an **authentication assertion** -- a group-signed JWT that is the
+ * OAuth authorization code -- without ever putting the password on the wire:
  *
- * The DPoP key pair is *not* one of those responsibilities. Section 13 of
- * docs/container-split.md moved it to the RP front end, which keeps the private key in its
- * own origin's IndexedDB and passes only the thumbprint down the chain. This SDK therefore
- * takes `cnfJkt` as a constructor argument and takes the DPoP proof for a refresh as a
- * `refresh()` argument; it can neither mint a key nor sign a proof.
+ * 1. Blinds the password locally via TOPRF (A = r * H1(pw)); the gateway and nodes never
+ *    see the password, `h` or `h_i`.
+ * 2. Sends the blinded point plus the assertion's claims (`clientId`, `scope`, the
+ *    authorize challenge `c` as `nonce`, `iat`, a 30-second `exp`) to the gateway.
+ * 3. Unblinds the TOPRF partials B_i to recover `h`, derives each `h_i`, and decrypts the
+ *    FROST share ct_i. A wrong password fails here, at the AEAD tag, and nowhere else.
+ * 4. Aggregates the FROST Ed25519 threshold signature into the finished assertion.
  *
- * Browser port of the gateway's `src/client-sdk/client.ts`
- * (docs/container-split.md section 11). What changed:
+ * The DPoP key pair is *not* one of those responsibilities. Section 13 moved it to the rp
+ * front end, which keeps the private key in its own origin's IndexedDB and passes only the
+ * thumbprint down the chain. This SDK therefore takes `cnfJkt` as a constructor argument
+ * and can neither mint a key nor sign a proof. The proof for the later `/token` exchange
+ * belongs to whoever holds that key (the rp front end, or the CLI stand-in that plays it).
+ *
+ * Browser port of the gateway's `src/client-sdk/client.ts` (docs/container-split.md
+ * section 11). What changed from the reference:
  *
  * - The in-process `proxy` branch and the `PastaOAuthProxy` import are gone. This SDK
- *   only speaks HTTP, so `proxyUrl` is a required string and `""` means same origin
- *   (the reference treated `""` as "not configured" because it tested truthiness).
- * - Key generation and proof creation moved out (section 13); `dpop.ts` itself is
- *   unchanged and still serves the CLI stand-in, which plays the RP front end too.
+ *   only speaks HTTP, so `proxyUrl` is a required string and `""` means same origin.
+ * - Key generation and proof creation moved out (section 13).
+ * - The signed payload is the section 14 assertion, not an id_token: it carries
+ *   `client_id`, `scope`, `nonce=c`, `aud=issuer` and a 30-second `exp`, in the byte order
+ *   the node README pins. `refresh()` was removed (section 14).
  * - `crypto.randomBytes(16)` -> `globalThis.crypto.getRandomValues`.
  * - `JSON.parse(Buffer.from(bytes).toString("utf8"))` -> `TextDecoder`.
  * - An optional `onEvent` sink emits the section 10 demo log.
  *
- * The cryptographic sequence is untouched: same blinding, same header and payload
- * objects in the same key order, same `createSigningInput`, same `deriveAeadNonce`
- * arguments, same aggregation order.
+ * The cryptographic sequence is untouched: same blinding, same `createSigningInput` over a
+ * key-sorted payload, same `deriveAeadNonce` arguments, same aggregation order. Only the
+ * claim set the payload carries is different.
  */
 export class DecentralizedClientSdk {
   private config: ClientAuthConfig;
@@ -121,17 +131,23 @@ export class DecentralizedClientSdk {
   }
 
   /**
-   * Execute Sign-On Flow:
-   * 1. Blind password locally: A = r * H_1(pw)
-   * 2. Send blinded point A and session nonce to proxy (proxy cannot decrypt or forge)
-   * 3. Receive TOPRF partial points B_i and encrypted shares ct_i from nodes
-   * 4. Unblind B_i locally to recover master h, derive h_i, and decrypt ct_i
-   * 5. Aggregate signature shares and mint id_token JWT
-   * 6. Save session secret rs_i for future refresh
+   * Run the authorization step: turn the password into an authentication assertion.
+   *
+   * 1. Blind the password locally: A = r * H1(pw).
+   * 2. Send A and the assertion's claims to the gateway (it never sees the password).
+   * 3. Receive TOPRF partials B_i and encrypted FROST shares ct_i from the nodes.
+   * 4. Unblind B_i to recover `h`, derive each `h_i`, decrypt ct_i.
+   * 5. Aggregate the shares and assemble the assertion JWT (`header.payload.sigma`).
+   *
+   * The returned `assertion` is the OAuth authorization code. It is passed to the rp with a
+   * plain redirect (`redirect_uri?code=<assertion>&state=<state>`); the gateway and nodes
+   * verify it later at `/token`, so nothing here trusts it.
    */
-  public async signOn(options: ClientSignOnOptions): Promise<{ id_token: string; sessionId: string }> {
+  public async signOn(
+    options: ClientSignOnOptions
+  ): Promise<{ assertion: string; sessionId: string }> {
     const now = Math.floor(Date.now() / 1000);
-    const exp = now + (options.lifetimeSeconds ?? 3600);
+    const exp = now + ASSERTION_LIFETIME_SECONDS;
 
     // 1. Client-side TOPRF Blinding: A = r * H_1(password)
     const { blinding, blinded } = blind(options.password);
@@ -159,10 +175,17 @@ export class DecentralizedClientSdk {
         blinded: blindedB64,
         sessionNonce: sessionNonceB64,
         cnfJkt: this.cnfJkt,
+        // The authorize challenge c. The node signs it as the assertion's `nonce`; sent
+        // without one, the payload would serialize to `"nonce":undefined` (invalid JSON)
+        // and `/sign` could not read the assertion back (docs/container-split.md §14).
         nonce: options.nonce,
+        clientId: options.clientId,
+        scope: options.scope,
         iat: now,
         exp,
-        aud: options.clientId,
+        // The assertion is addressed to the gateway, so its `aud` is the issuer, not the
+        // client. `client_id` travels separately and becomes the access token's `aud`.
+        aud: this.config.issuer,
         iss: this.config.issuer,
         participants: options.participants,
       }),
@@ -185,16 +208,22 @@ export class DecentralizedClientSdk {
         `(D,E)×${signOnResult.commitments.length}  sess=${signOnResult.sessionId.slice(0, 8)}`
     );
 
-    // 2. Prepare signing payload for decryption AAD and JWT assembly
+    // 2. Rebuild the assertion the nodes signed, in the byte order the node README pins
+    // (docs/container-split.md section 14). `deterministicJsonStringify` sorts keys, so
+    // the object order here does not reach the wire -- the alphabetical order does, and it
+    // must match the node byte for byte, because it is both the JWT payload and the AEAD
+    // AAD guarding each ct_i.
     const header = { alg: "EdDSA", typ: "JWT", kid: "pasta-group-key-1" };
     const payload = {
       iss: this.config.issuer,
       sub,
-      aud: options.clientId,
+      aud: this.config.issuer,
+      client_id: options.clientId,
+      scope: options.scope,
+      cnf: { jkt: this.cnfJkt },
+      nonce: options.nonce,
       iat: now,
       exp,
-      nonce: options.nonce,
-      cnf: { jkt: this.cnfJkt },
     };
 
     const { signingInput, headerB64, payloadB64 } = createSigningInput(header, payload);
@@ -207,9 +236,9 @@ export class DecentralizedClientSdk {
     const v = unblind(blinding, partials);
     const h = finalize(options.password, v);
 
-    // 4. Decrypt shares ct_i locally using derived h_i
+    // 4. Decrypt shares ct_i locally using derived h_i. Since section 14 ct_i carries the
+    // FROST share alone -- `{ z_i }`, no `rs_i` -- because the IdP front no longer refreshes.
     const shares: bigint[] = [];
-    const nodeSecrets = new Map<number, Uint8Array>();
 
     for (const nodeResp of signOnResult.nodeResponses) {
       const h_i = deriveServerKey(h, nodeResp.nodeId);
@@ -230,150 +259,30 @@ export class DecentralizedClientSdk {
 
       const parsed = JSON.parse(new TextDecoder().decode(decryptedBytes));
       shares.push(BigInt(parsed.z_i));
-      nodeSecrets.set(nodeResp.nodeId, base64UrlDecode(parsed.rs_i));
     }
 
     // 5. Aggregate FROST signature locally in client!
     const R_bytes = computeGroupCommitment(signingInput, signOnResult.commitments);
     const signature = aggregateSignatureShares(R_bytes, shares);
 
-    // 6. Complete JWT
-    const id_token = assembleJwt(headerB64, payloadB64, signature);
+    // 6. Complete the assertion (the OAuth authorization code)
+    const assertion = assembleJwt(headerB64, payloadB64, signature);
 
     this.emitStep(
       "signon-aggregate",
       undefined,
       `→ h=finalize(pw, unblind(r,B_i))  h_i×${signOnResult.nodeResponses.length}  ` +
         `z_i=dec(ct_i)×${shares.length} ${shares.map((z) => truncScalar(z)).join(" ")}  ` +
-        `R ${trunc(base64UrlEncode(R_bytes))}  σ=Σz_i  id_token ${trunc(id_token)} ✔ assembled only here`
+        `R ${trunc(base64UrlEncode(R_bytes))}  σ=Σz_i  ` +
+        `assertion ${trunc(assertion)} ✔ (auth code, 30s, aud=gateway)`
     );
 
-    // Store local session state for refresh (Hole 5)
     this.currentSession = {
       sessionId: signOnResult.sessionId,
       sub,
-      nodeSecrets,
-      counter: 0,
       cnfJkt: this.cnfJkt,
     };
 
-    return { id_token, sessionId: signOnResult.sessionId };
-  }
-
-  /**
-   * Execute Refresh Flow (Hole 5):
-   * 1. Send `options.dpopProof` -- an RFC 9449 proof the caller signed with the key
-   *    behind `cnfJkt` -- together with the sessionId to the proxy
-   * 2. Nodes verify the DPoP proof and encrypt new shares using rk_i = HKDF(rs_i, ctr)
-   * 3. Client decrypts new shares locally and aggregates a fresh id_token JWT
-   */
-  public async refresh(
-    options: ClientRefreshOptions
-  ): Promise<{ id_token: string; sessionId: string }> {
-    if (!this.currentSession) {
-      throw new Error("No active session in Client SDK. Sign-on required first.");
-    }
-
-    if (!options.dpopProof) {
-      throw new Error("A DPoP proof is required for refresh; the SDK holds no signing key.");
-    }
-
-    const nextCtr = this.currentSession.counter + 1;
-    const now = Math.floor(Date.now() / 1000);
-    const exp = now + (options.lifetimeSeconds ?? 3600);
-
-    const dpopProof = options.dpopProof;
-
-    let refreshResult: ProxyRefreshResult;
-
-    const res = await fetch(`${this.config.proxyUrl}/api/pasta/refresh`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sessionId: this.currentSession.sessionId,
-        dpopProof,
-        expectedHtu: options.refreshEndpointUrl,
-        nonce: options.nonce,
-        iat: now,
-        exp,
-        aud: options.clientId,
-        iss: this.config.issuer,
-        participants: options.participants,
-      }),
-    });
-    if (!res.ok) {
-      this.emitReject("refresh-reject", "refresh", `gateway returned HTTP ${res.status}`);
-      throw new Error(`Refresh proxy failed with status ${res.status}`);
-    }
-    refreshResult = refreshResultFromWire(await res.json());
-
-    // Build payload for new JWT
-    const header = { alg: "EdDSA", typ: "JWT", kid: "pasta-group-key-1" };
-    const payload = {
-      iss: this.config.issuer,
-      sub: this.currentSession.sub,
-      aud: options.clientId,
-      iat: now,
-      exp,
-      nonce: options.nonce,
-      cnf: { jkt: this.currentSession.cnfJkt },
-    };
-
-    const { signingInput, headerB64, payloadB64 } = createSigningInput(header, payload);
-
-    // Decrypt new shares locally using rk_i = HKDF(rs_i, nextCtr)
-    const shares: bigint[] = [];
-    for (const nodeResp of refreshResult.nodeResponses) {
-      const rs_i = this.currentSession.nodeSecrets.get(nodeResp.nodeId);
-      if (!rs_i) {
-        throw new Error(`Missing rs_i for node ${nodeResp.nodeId} in client session`);
-      }
-
-      const rk_i = deriveRefreshKey(rs_i, nextCtr, this.currentSession.sessionId);
-      const refreshNonce = deriveAeadNonce(
-        new TextEncoder().encode(`REFRESH:${this.currentSession.sessionId}:${nextCtr}`),
-        nodeResp.nodeId
-      );
-
-      let decryptedBytes: Uint8Array;
-      try {
-        decryptedBytes = aeadDecrypt(
-          rk_i,
-          refreshNonce,
-          base64UrlDecode(nodeResp.ct_i),
-          signingInput
-        );
-      } catch (err: any) {
-        this.emitReject(
-          "refresh-reject",
-          "refresh",
-          `ct_${nodeResp.nodeId} decrypt failed`
-        );
-        throw new Error(`Failed to decrypt refresh share from node ${nodeResp.nodeId}`);
-      }
-
-      const parsed = JSON.parse(new TextDecoder().decode(decryptedBytes));
-      shares.push(BigInt(parsed.z_i));
-    }
-
-    // Aggregate updated signature
-    const R_bytes = computeGroupCommitment(signingInput, refreshResult.commitments);
-    const signature = aggregateSignatureShares(R_bytes, shares);
-
-    const id_token = assembleJwt(headerB64, payloadB64, signature);
-
-    this.currentSession.counter = nextCtr;
-
-    this.emitStep(
-      "refresh",
-      "refresh",
-      `sess=${this.currentSession.sessionId.slice(0, 8)} ctr=${nextCtr}  → DPoP proof  ` +
-        `← ct_i×${refreshResult.nodeResponses.length} (D,E)×${refreshResult.commitments.length}  ` +
-        `→ rk_i=HKDF(rs_i,ctr)×${refreshResult.nodeResponses.length}  ` +
-        `z_i×${shares.length} ${shares.map((z) => truncScalar(z)).join(" ")}  ` +
-        `R ${trunc(base64UrlEncode(R_bytes))}  σ  new id_token ${trunc(id_token)} ✔`
-    );
-
-    return { id_token, sessionId: this.currentSession.sessionId };
+    return { assertion, sessionId: signOnResult.sessionId };
   }
 }

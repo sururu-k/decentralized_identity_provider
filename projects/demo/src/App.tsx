@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Shield, Key, Lock, CheckCircle2, RefreshCw, Send, ArrowRight, Server, Copy, AlertTriangle } from 'lucide-react';
+import { Shield, Key, Lock, CheckCircle2, RefreshCw, ArrowRight, Server, Copy, AlertTriangle } from 'lucide-react';
 import { DecentralizedClientSdk } from './sdk/client';
 import type { DemoEvent } from './sdk/events';
 
@@ -28,36 +28,48 @@ export default function App() {
   const initialStep = rawStep === 'jwt' ? 'completed' : (rawStep as any);
   const initialTab = rawStep === 'jwt' ? 'jwt' : (urlParams?.get('tab') as any) || 'visualizer';
 
-  // OAuth フロー連携パラメータ — /rp → /authorize → /demo?redirect_uri=...
+  // OAuth 認可コードフロー連携パラメータ (docs/container-split.md 第 14.1 節)
+  // rp フロント → gateway /authorize → gateway が /demo?c&dpop_jkt&client_id&redirect_uri&scope&state へ引き継ぐ
   const oauthRedirectUri = urlParams?.get('redirect_uri') || null;
-  const oauthClientId = urlParams?.get('client_id') || 'zk_app_portal';
-  const oauthNonce = urlParams?.get('nonce') || ('demo_nonce_' + Math.random().toString(36).substring(7));
-  const oauthState = urlParams?.get('state') || 'demo_state_xyz789';
+  const oauthClientId = urlParams?.get('client_id') || 'demo_client';
+  const oauthScope = urlParams?.get('scope') || 'openid profile';
+  // The authorize challenge `c`. It becomes the assertion's `nonce`, so a node can bind the
+  // authorization code to this authorize step. Without it there is no code to make.
+  const oauthChallenge = urlParams?.get('c') || null;
+  const oauthState = urlParams?.get('state') || '';
   // docs/container-split.md section 13: the DPoP key pair belongs to the rp front end.
   // This page never makes one -- it only receives the thumbprint that /authorize carried
-  // through, and binds the token to it. Without it there is nothing to bind to.
+  // through, and binds the assertion to it. Without it there is nothing to bind to.
   const oauthDpopJkt = urlParams?.get('dpop_jkt') || null;
-  const MISSING_JKT_MESSAGE =
-    'rp から dpop_jkt が渡されていません。http://localhost:3001/ から開始してください。';
+  // The flow only starts when the rp front end supplied all three: the DPoP thumbprint to
+  // bind to, the authorize challenge to sign, and where to send the code back.
+  const flowReady = Boolean(oauthDpopJkt && oauthChallenge && oauthRedirectUri);
+  const MISSING_FLOW_MESSAGE =
+    'rp から必要なパラメータ (dpop_jkt / c / redirect_uri) が渡されていません。' +
+    'http://localhost:3001/ から開始してください。';
 
+  // Screenshot-only mock (`?step=completed`). A section 14 authentication assertion: the
+  // signature bytes are not real, and the on-screen banner says so.
   const defaultMockToken =
-    'eyJhbGciOiJFZERTQSIswitchInR5cCI6IkpXVCIsImtpZCI6InBhc3RhLWZyb3N0ZWQyNTUxOS1wazEifQ.eyJpc3MiOiJodHRwczovL2lkcC5wYXN0YS5leGFtcGxlIiwic3ViIjoidXNyX2FsaWNlXzEyMzQ1IiwiYXVkIjoiemtfYXBwX3BvcnRhbCIsImlhdCI6MTcyMTAxMDAwMCwiZXhwIjoxNzIxMDEzODAwLCJqdGkiOiJqdGlfZGVtb185OTkiLCJjbmYiOnsiamt0IjoiNmNQUU5JbWZiaHFtakh6NVhEOVU4MjZ1WllMNUtSNVNtOWJtM051UVhNIn19.dGVzdF9zaWduYXR1cmVfZm9yX2RlbW9fcGFzdGFfZm9yX3NjcmVlbnNob3Q';
+    'eyJhbGciOiJFZERTQSIsImtpZCI6InBhc3RhLWdyb3VwLWtleS0xIiwidHlwIjoiSldUIn0.eyJhdWQiOiJodHRwOi8vbG9jYWxob3N0OjMwMDAiLCJjbGllbnRfaWQiOiJkZW1vX2NsaWVudCIsImNuZiI6eyJqa3QiOiI2Y1BRTkltZmJocW1qSHo1WEQ5VTgyNnVaWUw1S1I1U205Ym0zTnVRWE0ifSwiZXhwIjoxNzU3MDMwNDMwLCJpYXQiOjE3NTcwMzA0MDAsImlzcyI6Imh0dHA6Ly9sb2NhbGhvc3Q6MzAwMCIsIm5vbmNlIjoiY19kZW1vXzlmM2MxYTIwIiwic2NvcGUiOiJvcGVuaWQgcHJvZmlsZSIsInN1YiI6InVzcl9hbGljZV8xMjM0NSJ9.Zqx3demo_group_signature_for_screenshot_only_not_verifiable_bytes';
 
   const [step, setStep] = useState<'login' | 'consent' | 'signing' | 'completed'>(initialStep);
   const [username, setUsername] = useState('alice');
   const [password, setPassword] = useState('password123');
-  const [idToken, setIdToken] = useState<string | null>(initialStep === 'completed' ? defaultMockToken : null);
+  const [assertion, setAssertion] = useState<string | null>(initialStep === 'completed' ? defaultMockToken : null);
   const [decodedToken, setDecodedToken] = useState<any>(
     initialStep === 'completed'
       ? {
-          header: { alg: 'EdDSA', typ: 'JWT', kid: 'pasta-frosted25519-pk1' },
+          header: { alg: 'EdDSA', typ: 'JWT', kid: 'pasta-group-key-1' },
           payload: {
-            iss: 'https://idp.pasta.example',
+            iss: 'http://localhost:3000',
             sub: 'usr_alice_12345',
-            aud: 'zk_app_portal',
-            iat: 1721010000,
-            exp: 1721013800,
-            jti: 'jti_demo_999',
+            aud: 'http://localhost:3000',
+            client_id: 'demo_client',
+            scope: 'openid profile',
+            nonce: 'c_demo_9f3c1a20',
+            iat: 1757030400,
+            exp: 1757030430,
             cnf: { jkt: '6cPQNImfbhqmjHz5XD9U826uZYL5KR5Sm9bm3NuQXM' },
           },
         }
@@ -67,14 +79,13 @@ export default function App() {
     initialStep === 'completed'
       ? [
           '分散サインオン処理を開始します (PASTA + FROST)...',
-          '端末内でRFC 9449 DPoP用の一時Ed25519キーペアを生成中...',
-          'DPoP公開鍵サムプリント算出完了: cnf.jkt = 6cPQNImfbhqmjHz5XD9U826uZYL5KR5Sm9bm3NuQXM',
+          'rp フロントから受け取った DPoP サムプリントに束縛: cnf.jkt = 6cPQNImfbhqmjHz5XD9U826uZYL5KR5Sm9bm3NuQXM',
           'ブラウザ内でパスワードを目隠し暗号化: A = r * H1(pw) (Ristretto255群)...',
           '各ノードがパスワードを検証することなく 2HashTDH 部分評価値 B_i を計算完了',
           '各ノードがFROST署名シェア z_i を生成し、h_i で暗号化完了',
           'クライアント端末で暗号文 ct_i を復号成功（正しいパスワード所持の暗号学的証明）',
           'ラグランジュ補間係数を用いてFROST Schnorr署名を集約: z = sum(z_i)',
-          '標準Ed25519公開鍵で検証可能なIDトークンが完成しました',
+          '認可コードとなる認証アサーション (30秒有効, aud=gateway) が完成しました',
         ]
       : []
   );
@@ -97,7 +108,7 @@ export default function App() {
 
   /**
    * Demo log sink (docs/container-split.md section 10, "browser" column). The SDK emits
-   * one line per protocol step -- sign-on is three lines, refresh is one -- and they go to
+   * one line per protocol step -- sign-on is three lines (blind, response, aggregate) -- and they go to
    * the log tab and to `console.log` verbatim, so the browser column can be read next to
    * the node and gateway terminals. No secret ever reaches a line: the SDK cuts every
    * per-session value to 8 characters and never passes the password, `h` or `h_i`.
@@ -131,9 +142,24 @@ export default function App() {
     return `サインオンに失敗しました: ${message}`;
   };
 
+  /**
+   * Send the finished assertion back to the rp as the OAuth authorization code
+   * (docs/container-split.md section 14.1, step 7): a plain GET redirect to
+   * `redirect_uri?code=<assertion>&state=<state>`. The gateway and nodes are not on this
+   * path; the rp's callback page exchanges the code at `/token` next.
+   */
+  const redirectToRpWithCode = (code: string) => {
+    if (!oauthRedirectUri) return;
+    const sep = oauthRedirectUri.includes('?') ? '&' : '?';
+    const url =
+      `${oauthRedirectUri}${sep}code=${encodeURIComponent(code)}` +
+      `&state=${encodeURIComponent(oauthState)}`;
+    window.location.href = url;
+  };
+
   const startSignOn = async () => {
-    if (!oauthDpopJkt) {
-      setError(MISSING_JKT_MESSAGE);
+    if (!flowReady) {
+      setError(MISSING_FLOW_MESSAGE);
       return;
     }
 
@@ -141,22 +167,23 @@ export default function App() {
     setLogs([]);
     setError(null);
     setIsMockView(false);
-    setIdToken(null);
+    setAssertion(null);
     setDecodedToken(null);
     addLog('分散サインオン処理を開始します (PASTA + FROST)...');
 
     // The page is served by the gateway itself, so an empty proxyUrl means same origin
-    // and window.location.origin is the ISSUER the gateway signs with.
+    // and window.location.origin is the ISSUER the assertion is signed under (its aud too).
     const client = new DecentralizedClientSdk(
       {
         proxyUrl: '',
         issuer: window.location.origin,
         onEvent: handleDemoEvent,
       },
-      oauthDpopJkt
+      oauthDpopJkt as string
     );
     addLog(`rp フロントから受け取った DPoP サムプリントに束縛します: cnf.jkt = ${client.cnfJkt}`);
     addLog('この画面は DPoP 秘密鍵を持ちません。鍵は rp オリジンの IndexedDB にあります。');
+    addLog(`認可チャレンジ c = ${oauthChallenge} を認証アサーションの nonce に署名します。`);
 
     // 2. Client-side Password Blinding
     addLog('ブラウザ内でパスワードを目隠し暗号化: A = r * H1(pw) (Ristretto255群)...');
@@ -171,21 +198,27 @@ export default function App() {
     addLog('各ノードがパスワードを検証することなく 2HashTDH 部分評価値 B_i = k_i * A を計算中...');
 
     try {
-      const { id_token } = await client.signOn({
+      const { assertion } = await client.signOn({
         username,
         password,
         clientId: oauthClientId,
-        nonce: oauthNonce,
+        scope: oauthScope,
+        nonce: oauthChallenge as string,
       });
 
       addLog('クライアント端末で暗号文 ct_i を復号成功（正しいパスワード所持の暗号学的証明）！');
       addLog('ラグランジュ補間係数を用いてFROST Schnorr署名を集約: z = sum(z_i)');
-      addLog('標準Ed25519公開鍵で検証可能なIDトークンが完成しました！');
+      addLog('認可コードとなる認証アサーション (30秒有効, aud=gateway) が完成しました！');
+      addLog(`rp の ${oauthRedirectUri} へ code=<assertion> で遷移します…`);
 
-      setIdToken(id_token);
-      setDecodedToken(decodeJwt(id_token));
+      setAssertion(assertion);
+      setDecodedToken(decodeJwt(assertion));
       setNodes((prev) => prev.map((n) => ({ ...n, state: 'success' })));
       setStep('completed');
+
+      // Section 14.1 step 7: hand the code back to the rp. Only on success -- a wrong
+      // password throws above and never reaches this redirect.
+      redirectToRpWithCode(assertion);
     } catch (err) {
       const message = describeFailure(err);
       addLog(message);
@@ -196,36 +229,11 @@ export default function App() {
   };
 
   const copyToken = () => {
-    if (idToken) {
-      navigator.clipboard.writeText(idToken);
+    if (assertion) {
+      navigator.clipboard.writeText(assertion);
       setIsCopied(true);
       setTimeout(() => setIsCopied(false), 2000);
     }
-  };
-
-  const submitFormPostToRp = () => {
-    if (!idToken) return;
-    const targetUri = oauthRedirectUri || 'http://localhost:3000/demo/rp-callback';
-    const form = document.createElement('form');
-    form.method = 'POST';
-    form.action = targetUri;
-    form.target = oauthRedirectUri ? '_self' : '_blank';
-
-    const tokenInput = document.createElement('input');
-    tokenInput.type = 'hidden';
-    tokenInput.name = 'id_token';
-    tokenInput.value = idToken;
-    form.appendChild(tokenInput);
-
-    const stateInput = document.createElement('input');
-    stateInput.type = 'hidden';
-    stateInput.name = 'state';
-    stateInput.value = oauthState;
-    form.appendChild(stateInput);
-
-    document.body.appendChild(form);
-    form.submit();
-    document.body.removeChild(form);
   };
 
   const getNodeStateLabel = (state: NodeStatus['state']) => {
@@ -253,7 +261,7 @@ export default function App() {
                 FROST Ed25519
               </span>
             </h1>
-            <p className="text-xs text-slate-400">ゼロ知識中継 OAuth 2.0 / OpenID Connect アーキテクチャ</p>
+            <p className="text-xs text-slate-400">ゼロ知識中継 OAuth 2.0 認可コードフロー (DPoP)</p>
           </div>
         </div>
 
@@ -289,10 +297,10 @@ export default function App() {
 
               {/* Section 13: no dpop_jkt means no key to bind the token to, so the flow
                   stops here rather than inventing one on this origin. */}
-              {!oauthDpopJkt && (
+              {!flowReady && (
                 <div className="p-3 rounded-lg bg-amber-950/40 border border-amber-800/60 text-xs text-amber-200 flex items-start gap-2">
                   <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
-                  <span className="leading-relaxed">{MISSING_JKT_MESSAGE}</span>
+                  <span className="leading-relaxed">{MISSING_FLOW_MESSAGE}</span>
                 </div>
               )}
 
@@ -356,8 +364,8 @@ export default function App() {
 
               <button
                 onClick={() => setStep('consent')}
-                disabled={!oauthDpopJkt}
-                title={oauthDpopJkt ? undefined : MISSING_JKT_MESSAGE}
+                disabled={!flowReady}
+                title={flowReady ? undefined : MISSING_FLOW_MESSAGE}
                 className="w-full py-3 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:shadow-none text-white font-semibold text-sm transition flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/30 mt-2"
               >
                 権限の確認へ進む
@@ -376,7 +384,7 @@ export default function App() {
 
             <div className="space-y-3 mb-6">
               {[
-                { id: 'openid', label: 'OpenID プロファイル', desc: 'FROST 定足数によって署名された標準 EdDSA (Ed25519) JWT IDトークン' },
+                { id: 'openid', label: '認証アサーション (認可コード)', desc: 'FROST 定足数が署名した標準 EdDSA (Ed25519) JWT。30秒有効の OAuth 認可コード' },
                 { id: 'profile', label: 'ユーザー固有識別子 (sub)', desc: '分散IdP環境で決定論的に決定される一意な識別子 (usr_alice_12345)' },
                 { id: 'email', label: 'DPoP プルーフ束縛 (RFC 9449)', desc: 'rp フロントが生成した公開鍵へのトークン厳格束縛 (cnf.jkt = dpop_jkt)' },
               ].map((item) => (
@@ -399,8 +407,8 @@ export default function App() {
               </button>
               <button
                 onClick={startSignOn}
-                disabled={!oauthDpopJkt}
-                title={oauthDpopJkt ? undefined : MISSING_JKT_MESSAGE}
+                disabled={!flowReady}
+                title={flowReady ? undefined : MISSING_FLOW_MESSAGE}
                 className="flex-[2] py-2.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:shadow-none text-white font-semibold text-xs transition shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-2"
               >
                 <Key className="w-4 h-4" />
@@ -463,7 +471,7 @@ export default function App() {
                           : 'bg-slate-800/60 border-slate-700 text-slate-400 hover:bg-slate-800'
                       }`}
                     >
-                      {tab === 'visualizer' ? 'ノード通信可視化' : tab === 'jwt' ? 'JWT トークン検証' : '処理ログ'}
+                      {tab === 'visualizer' ? 'ノード通信可視化' : tab === 'jwt' ? '認証アサーション' : '処理ログ'}
                     </button>
                   ))}
                 </div>
@@ -538,14 +546,14 @@ export default function App() {
                       </div>
                     </div>
 
-                    {step === 'completed' && (
+                    {step === 'completed' && !isMockView && assertion && (
                       <div className="flex items-center gap-2">
                         <button
-                          onClick={submitFormPostToRp}
+                          onClick={() => redirectToRpWithCode(assertion)}
                           className="py-2 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs transition flex items-center gap-2 shadow-lg shadow-emerald-600/30"
                         >
-                          <Send className="w-3.5 h-3.5" />
-                          RPへ form_post で直接送信
+                          <ArrowRight className="w-3.5 h-3.5" />
+                          rp へ認可コードを渡して戻る
                         </button>
                       </div>
                     )}
@@ -554,25 +562,25 @@ export default function App() {
               )}
 
               {/* Tab 2: JWT Viewer */}
-              {activeTab === 'jwt' && idToken && (
+              {activeTab === 'jwt' && assertion && (
                 <div className="space-y-4">
                   <div className="flex items-center justify-between">
-                    <span className="text-xs text-slate-400">標準 RFC 7519 JWT (アルゴリズム: EdDSA, RFC 8037)</span>
+                    <span className="text-xs text-slate-400">認証アサーション (認可コード) — 標準 EdDSA JWT (RFC 8037, RFC 7519)</span>
                     <button
                       onClick={copyToken}
                       className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs flex items-center gap-1.5 transition"
                     >
                       <Copy className="w-3.5 h-3.5" />
-                      {isCopied ? 'コピー完了！' : 'JWTをコピー'}
+                      {isCopied ? 'コピー完了！' : 'アサーションをコピー'}
                     </button>
                   </div>
 
                   <div className="p-3.5 rounded-xl bg-slate-950 font-mono text-xs break-all leading-relaxed border border-slate-800">
-                    <span className="text-rose-400 font-semibold">{idToken.split('.')[0]}</span>
+                    <span className="text-rose-400 font-semibold">{assertion.split('.')[0]}</span>
                     <span className="text-slate-600">.</span>
-                    <span className="text-purple-400 font-semibold">{idToken.split('.')[1]}</span>
+                    <span className="text-purple-400 font-semibold">{assertion.split('.')[1]}</span>
                     <span className="text-slate-600">.</span>
-                    <span className="text-cyan-400 font-semibold">{idToken.split('.')[2]}</span>
+                    <span className="text-cyan-400 font-semibold">{assertion.split('.')[2]}</span>
                   </div>
 
                   {decodedToken && (
@@ -629,7 +637,7 @@ export default function App() {
 
       {/* Footer */}
       <footer className="border-t border-slate-900 py-4 px-6 text-center text-xs text-slate-500">
-        PASTA (CCS 2018) + FROST (RFC 8032 Ed25519) 実装 &bull; RFC 9449 DPoP 一時鍵束縛 &bull; response_mode=form_post
+        PASTA (CCS 2018) + FROST (RFC 8032 Ed25519) 実装 &bull; RFC 9449 DPoP 束縛 &bull; OAuth 2.0 認可コード (認証アサーション)
       </footer>
     </div>
   );

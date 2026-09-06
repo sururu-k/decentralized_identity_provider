@@ -7,9 +7,9 @@
 import "./buffer-shim.js";
 
 export {
+  ASSERTION_LIFETIME_SECONDS,
   DecentralizedClientSdk,
   type ClientAuthConfig,
-  type ClientRefreshOptions,
   type ClientSignOnOptions,
   type StoredSession,
 } from "./client.js";
@@ -46,12 +46,9 @@ export {
   type DPoPJwk,
   type DPoPKeyPair,
 } from "./dpop.js";
-export { refreshResultFromWire, signOnResultFromWire } from "./wire.js";
+export { signOnResultFromWire } from "./wire.js";
 export type {
-  ProxyRefreshRequestBody,
-  ProxyRefreshResult,
   ProxySignOnRequestBody,
   ProxySignOnResult,
-  RefreshResponse,
   SignOnResponse,
 } from "./types.js";

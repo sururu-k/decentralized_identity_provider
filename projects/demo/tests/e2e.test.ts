@@ -1,48 +1,55 @@
 import crypto from "node:crypto";
+import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
-import { DecentralizedClientSdk } from "../src/sdk/client.js";
-import {
-  calculateJwkThumbprint,
-  createDPoPProof,
-  exportDPoPJwk,
-  generateDPoPKeyPair,
-} from "../src/sdk/dpop.js";
-import { CONTINUATION_INDENT, type DemoEvent } from "../src/sdk/events.js";
 import { base64UrlDecode } from "../src/sdk/jwt.js";
 
 /**
  * Integration test against a running stack.
  *
- * Standing up three fake nodes plus a gateway inside vitest would duplicate
- * `projects/gateway/tests/`, so this exercises the real thing instead:
+ * It drives the CLI stand-in (`cli/sign-on.ts`) exactly as the integration script does --
+ * the CLI plays both the rp front end (makes the DPoP key, exchanges the code at `/token`)
+ * and the IdP front end (runs the browser SDK to mint the assertion). So this exercises the
+ * whole section 14 flow, not just the SDK:
  *
  *   docker compose up -d --build --wait
  *   DEMO_E2E_GATEWAY=http://localhost:3000 npm test
  *
  * Without `DEMO_E2E_GATEWAY` the suite is skipped, so `npm test` stays offline by default.
+ * The gateway's `/token` endpoint is still being built; until it lands this suite stays
+ * skipped, and the always-on aggregation checks live in `sdk.test.ts` instead.
  *
- * Signature verification deliberately uses `node:crypto` with the JWKS key rather than
- * the SDK's own `verifyJwt`: the point is that a token this SDK assembled verifies as a
- * plain Ed25519 JWT for a relying party that shares no code with it.
- *
- * Since section 13 the SDK holds no DPoP key, so these tests play the rp front end: they
- * make the key pair, pass the SDK the thumbprint, and sign the refresh proof themselves.
+ * Verification deliberately uses `node:crypto` with the JWKS key rather than any SDK code:
+ * the point is that the access token the flow produced verifies as a plain Ed25519 JWT for
+ * a relying party that shares no code with the issuer. The token's `cnf.jkt` is the CLI's
+ * own ephemeral key, which this process cannot see, so it checks the signature, `typ`,
+ * `aud`, `iss` and `exp` -- the node-level tests cover the `cnf.jkt` binding.
  */
-
-/** A DPoP key pair standing in for the one the rp landing page keeps in IndexedDB. */
-function rpFrontEndKey(): { keyPair: ReturnType<typeof generateDPoPKeyPair>; jkt: string } {
-  const keyPair = generateDPoPKeyPair();
-  return { keyPair, jkt: calculateJwkThumbprint(exportDPoPJwk(keyPair.publicKey)) };
-}
 
 const GATEWAY = process.env.DEMO_E2E_GATEWAY;
 const describeIfGateway = GATEWAY ? describe : describe.skip;
+
+const execFileAsync = promisify(execFile);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const CLI = path.resolve(HERE, "../cli/sign-on.ts");
 
 interface Jwk {
   kty: string;
   crv: string;
   x: string;
   kid: string;
+}
+
+/** Runs the CLI stand-in and returns the last line of stdout (the token) and its stderr. */
+async function runCli(args: string[]): Promise<{ token: string; stderr: string }> {
+  const { stdout, stderr } = await execFileAsync("npx", ["tsx", CLI, ...args], {
+    cwd: path.resolve(HERE, ".."),
+    env: { ...process.env, DEMO_LOG: "1", FORCE_COLOR: "0" },
+  });
+  const lines = stdout.trimEnd().split("\n");
+  return { token: lines[lines.length - 1], stderr };
 }
 
 async function fetchJwks(gateway: string): Promise<Jwk[]> {
@@ -52,8 +59,8 @@ async function fetchJwks(gateway: string): Promise<Jwk[]> {
   return body.keys;
 }
 
-function verifyWithJwks(idToken: string, keys: Jwk[]): { header: any; payload: any } {
-  const [headerB64, payloadB64, sigB64] = idToken.split(".");
+function verifyWithJwks(token: string, keys: Jwk[]): { header: any; payload: any } {
+  const [headerB64, payloadB64, sigB64] = token.split(".");
   const decoder = new TextDecoder();
   const header = JSON.parse(decoder.decode(base64UrlDecode(headerB64)));
   const payload = JSON.parse(decoder.decode(base64UrlDecode(payloadB64)));
@@ -72,117 +79,59 @@ function verifyWithJwks(idToken: string, keys: Jwk[]): { header: any; payload: a
   return { header, payload };
 }
 
-describeIfGateway("demo SDK against a live gateway", () => {
+describeIfGateway("demo CLI against a live gateway", () => {
   const gateway = GATEWAY as string;
 
-  it("signs alice on, and the token verifies against /jwks.json", async () => {
-    const events: DemoEvent[] = [];
-    const { jkt } = rpFrontEndKey();
-    const sdk = new DecentralizedClientSdk(
-      { proxyUrl: gateway, issuer: gateway, onEvent: (e) => events.push(e) },
-      jkt
-    );
+  it("mints an access token that verifies against /jwks.json", async () => {
+    const { token, stderr } = await runCli([
+      "--gateway", gateway,
+      "--user", "alice",
+      "--password", "password123",
+      "--client-id", "demo_client",
+      "--scope", "openid profile",
+      "--nonce", "demo_e2e_nonce_1",
+    ]);
 
-    const { id_token, sessionId } = await sdk.signOn({
-      username: "alice",
-      password: "password123",
-      clientId: "demo_client",
-      nonce: "demo_e2e_nonce_1",
-    });
-    expect(sessionId).toBeTruthy();
-
-    const { header, payload } = verifyWithJwks(id_token, await fetchJwks(gateway));
+    const { header, payload } = verifyWithJwks(token, await fetchJwks(gateway));
     expect(header.alg).toBe("EdDSA");
+    expect(header.typ).toBe("at+jwt");
     expect(header.kid).toBe("pasta-group-key-1");
     expect(payload.iss).toBe(gateway);
-    expect(payload.sub).toBe("usr_alice_12345");
     expect(payload.aud).toBe("demo_client");
-    expect(payload.nonce).toBe("demo_e2e_nonce_1");
-    expect(payload.cnf.jkt).toBe(sdk.cnfJkt);
-    expect(sdk.cnfJkt).toBe(jkt);
+    expect(payload.scope).toBe("openid profile");
+    expect(payload.cnf?.jkt).toBeTruthy();
 
-    // Section 10: one sign-on event of three lines -- blind, response, aggregate.
-    expect(events.map((e) => e.step)).toEqual([
-      "signon-blind",
-      "signon-response",
-      "signon-aggregate",
+    // Section 10 browser column reached stderr, and no password leaked.
+    expect(stderr).toMatch(/\[browser\] sign-on /);
+    expect(stderr).not.toContain("password123");
+  }, 60_000);
+
+  it("refreshes for a new access token that still verifies", async () => {
+    const { token } = await runCli([
+      "--gateway", gateway,
+      "--user", "alice",
+      "--password", "password123",
+      "--client-id", "demo_client",
+      "--scope", "openid profile",
+      "--nonce", "demo_e2e_nonce_2",
+      "--refresh",
     ]);
-    const lines = events.flatMap((e) => e.lines);
-    expect(lines).toHaveLength(3);
-    expect(lines[0]).toMatch(/^\[browser\] sign-on   user=alice nonce=demo_e2e_nonce_1 {2}→ r /);
-    // Section 13: the thumbprint is labelled as the rp's, not this page's.
-    expect(lines[0]).toContain(`jkt(rp) ${jkt.slice(0, 8)}`);
-    expect(lines[1]).toBe(`${CONTINUATION_INDENT}${lines[1].slice(CONTINUATION_INDENT.length)}`);
-    expect(lines[1]).toContain("← B_i×3 ct_i×3 (D,E)×3  sess=");
-    expect(lines[2]).toContain("→ h=finalize(pw, unblind(r,B_i))");
-    expect(lines[2]).toContain("✔ assembled only here");
-    // No secret leaks into a log line.
-    for (const line of lines) {
-      expect(line).not.toContain("password123");
-    }
-  }, 30_000);
 
-  it("refreshes with a DPoP proof and the new token still verifies", async () => {
-    const events: DemoEvent[] = [];
-    const { keyPair, jkt } = rpFrontEndKey();
-    const sdk = new DecentralizedClientSdk(
-      { proxyUrl: gateway, issuer: gateway, onEvent: (e) => events.push(e) },
-      jkt
-    );
+    const { header, payload } = verifyWithJwks(token, await fetchJwks(gateway));
+    expect(header.typ).toBe("at+jwt");
+    expect(payload.aud).toBe("demo_client");
+    expect(payload.cnf?.jkt).toBeTruthy();
+  }, 60_000);
 
-    const first = await sdk.signOn({
-      username: "alice",
-      password: "password123",
-      clientId: "demo_client",
-      nonce: "demo_e2e_nonce_2",
-    });
-
-    const refreshEndpointUrl = `${gateway}/api/pasta/refresh`;
-    const refreshed = await sdk.refresh({
-      clientId: "demo_client",
-      nonce: "demo_e2e_nonce_2",
-      refreshEndpointUrl,
-      dpopProof: createDPoPProof(keyPair, "POST", refreshEndpointUrl),
-    });
-
-    expect(refreshed.sessionId).toBe(first.sessionId);
-    expect(refreshed.id_token).not.toBe(first.id_token);
-
-    const { payload } = verifyWithJwks(refreshed.id_token, await fetchJwks(gateway));
-    expect(payload.sub).toBe("usr_alice_12345");
-    expect(payload.cnf.jkt).toBe(sdk.cnfJkt);
-    expect(sdk.getCurrentSession()?.counter).toBe(1);
-
-    // Refresh is a single line (section 10).
-    expect(events.at(-1)?.step).toBe("refresh");
-    expect(events.at(-1)?.lines).toHaveLength(1);
-    expect(events.at(-1)?.lines[0]).toMatch(/^\[browser\] refresh   sess=\S+ ctr=1 {2}→ DPoP proof/);
-    expect(events.at(-1)?.lines[0]).toContain("rk_i=HKDF(rs_i,ctr)×");
-  }, 30_000);
-
-  it("fails locally on a wrong password, with the nodes none the wiser", async () => {
-    const events: DemoEvent[] = [];
-    const { jkt } = rpFrontEndKey();
-    const sdk = new DecentralizedClientSdk(
-      { proxyUrl: gateway, issuer: gateway, onEvent: (e) => events.push(e) },
-      jkt
-    );
-
+  it("fails with exit 1 on a wrong password, without a token on stdout", async () => {
     await expect(
-      sdk.signOn({
-        username: "alice",
-        password: "wrong-password",
-        clientId: "demo_client",
-        nonce: "demo_e2e_nonce_3",
-      })
-    ).rejects.toThrow(/Failed to decrypt share from node/);
-
-    // The gateway answered normally; the failure is the AEAD tag in this process.
-    expect(events.map((e) => e.step)).toContain("signon-response");
-    expect(events.at(-1)?.kind).toBe("reject");
-    expect(events.at(-1)?.lines).toEqual([
-      "[browser] ✖ sign-on failed: ct_1 decrypt failed → wrong password (nodes cannot tell)",
-    ]);
-    expect(sdk.getCurrentSession()).toBeNull();
-  }, 30_000);
+      runCli([
+        "--gateway", gateway,
+        "--user", "alice",
+        "--password", "wrong-password",
+        "--client-id", "demo_client",
+        "--nonce", "demo_e2e_nonce_3",
+      ])
+    ).rejects.toMatchObject({ code: 1 });
+  }, 60_000);
 });

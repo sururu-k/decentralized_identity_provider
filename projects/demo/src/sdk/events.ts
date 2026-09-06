@@ -4,9 +4,10 @@
  * This module is an addition to the port, not part of the reference SDK. The SDK calls
  * `onEvent` at each protocol step; the demo UI pushes the lines into its log tab and
  * `console.log`, and the CLI stand-in writes them to stderr. Sign-on is one event of
- * three lines — blind, response, aggregate — and refresh is one line, in the same column
- * widths the node, gateway and rp components print, so the terminals can be read side by
- * side.
+ * three lines — blind, response, aggregate — in the same column widths the node, gateway
+ * and rp components print, so the terminals can be read side by side. Since section 14 the
+ * IdP front end no longer refreshes (the rp front end does, at `/token`), so there is no
+ * refresh event here.
  *
  * Nothing secret reaches a line. The password, the master PRF value `h` and the derived
  * `h_i` are never passed in. Per-session values (`r`, `A`, `B_i`, `ct_i`, `z_i`, `R`,
@@ -30,9 +31,7 @@ export type DemoStep =
   | "signon-blind"
   | "signon-response"
   | "signon-aggregate"
-  | "signon-reject"
-  | "refresh"
-  | "refresh-reject";
+  | "signon-reject";
 
 export interface DemoEvent {
   kind: "step" | "reject";
