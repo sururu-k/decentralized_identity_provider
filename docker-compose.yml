@@ -89,7 +89,6 @@ services:
     image: pasta-rp
     environment:
       ISSUER: http://localhost:3000 # iss 検証と /authorize の組み立て
-      IDP_INTERNAL_URL: http://gateway:3000 # サーバ側の JWKS 取得先
       RP_BASE_URL: http://localhost:3001 # redirect_uri = ${RP_BASE_URL}/callback
     ports:
       - "3001:3001"

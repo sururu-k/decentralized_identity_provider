@@ -208,7 +208,11 @@ node dist/index.js --out <dir> [--threshold 2] [--total 3] [--key-id pasta-group
 
 ### 責務
 
-既存 `src/bin/gateway.ts` の `/rp` (ランディング) と `/rp/callback` (form_post 受信・検証・表示) を独立サービスにする。**署名検証は gateway の JWKS から取得した公開鍵で行う** (group.json を読まない)。JWT の解析と Ed25519 検証は `node:crypto` (`crypto.verify(null, data, { key: jwk, format: "jwk" }, sig)`) で行い、IdP 実装のコードを共有しないことを示す。
+OAuth 2.0 の **クライアント (Relying Party)**。認可コードフロー + DPoP (第 14 節) に対応する。
+**サーバは HTML を配るだけ**で、`/token` の呼び出し・JWKS の取得・アクセストークンの検証は
+すべてブラウザ内のインライン JS が行う。理由は DPoP 秘密鍵が rp オリジンの IndexedDB にしか
+無いこと (第 13 節) で、鍵を持たないサーバは proof を作れず、proof が無ければノードは署名しない。
+したがって **rp サーバはアクセストークンを一度も見ない**。ランタイム依存ゼロ、ブラウザ側もビルド無し。
 
 ### 環境変数
 
@@ -216,24 +220,60 @@ node dist/index.js --out <dir> [--threshold 2] [--total 3] [--key-id pasta-group
 |---|---|---|
 | `PORT` | `3001` | 待受 |
 | `RP_BASE_URL` | `http://localhost:3001` | `redirect_uri` の組み立てに使う |
-| `ISSUER` | `http://localhost:3000` | `/authorize` の組み立てと `iss` 検証 |
-| `IDP_INTERNAL_URL` | 未設定なら `ISSUER` | JWKS 取得先 (compose では `http://gateway:3000`) |
-| `CLIENT_ID` | `demo_client` | `aud` 検証 |
+| `ISSUER` | `http://localhost:3000` | `/authorize`・`/token`・`/jwks.json` の基底 URL、かつブラウザが照合する `iss` |
+| `CLIENT_ID` | `demo_client` | `client_id` パラメータと、ブラウザが照合する `aud` |
+
+`IDP_INTERNAL_URL` は **削除済み**。サーバ側の JWKS 取得が無くなり、`/jwks.json` を fetch するのは
+ブラウザだけになったため、compose 内部ホスト名を指す設定は存在してはいけない (環境に残っていても無視する)。
 
 ### HTTP
 
 | Method | Path | 備考 |
 |---|---|---|
-| GET | `/` | 既存 `/rp` の HTML。`redirect_uri` は `${RP_BASE_URL}/callback`。インライン JS が WebCrypto Ed25519 の DPoP 鍵を IndexedDB (`pasta-rp`/`dpop`) に用意し、jkt を画面に出してログインリンクに `&dpop_jkt=<jkt>` を付ける (第 13 節) |
-| POST | `/callback` | 既存 `/rp/callback` の HTML。`iss`, `aud`, `exp`, 署名を検証。`kid` で JWKS から鍵を選ぶ。JWKS は起動時ではなく初回要求時に取得しキャッシュ (未知 `kid` で再取得)。サーバはトークンの `cnf.jkt` を表示し、インライン JS が IndexedDB の鍵から再計算した jkt との一致を ✓/✖ で示す (鍵はサーバに送らない、第 13 節) |
+| GET | `/` | ランディング HTML。`response_type=code&client_id&redirect_uri=${RP_BASE_URL}/callback&scope=openid%20profile%20email&state=<乱数>` の authorize URL を組み立てる。インライン JS が WebCrypto Ed25519 の DPoP 鍵を IndexedDB (`pasta-rp`/`dpop`) に用意し、jkt を画面に出してログインリンクに `&dpop_jkt=<jkt>` を付ける (第 13 節)。`state` は `sessionStorage` に保存する |
+| GET | `/callback?code&state` | トークン取得ページ。サーバは `code` / `state` / `issuer` / `client_id` / `redirect_uri` をエスケープして `data-` 属性に埋めた HTML を返すだけで、**`/token` は呼ばない**。`code` は認証アサーション JWT そのものなので、切り詰めず・解釈せずバイト列のまま通す |
 | GET | `/health` | `{ "status": "ok" }` |
 
-ステータスコード: 検証成功 200、署名・`iss`・`aud`・`exp`・未知 `kid`・`alg` 不正など検証失敗 401 (失敗 HTML)、`id_token` 欠落 400、リクエストボディ 1MB 超過 413、JWKS 取得不能 502。JWKS 取得失敗はキャッシュせず次回要求で再試行する。未知 `kid` での再取得は、キャッシュ済み文書に対してのみ 1 回行う (取得直後の文書に無い `kid` はそのまま 401)。`iat`/`nbf` は 60 秒のクロックスキューを許容する。未知 `kid` による再取得にレート制限は設けない (デモ範囲)。`nonce` と `state` は表示のみで照合しない (参照実装に合わせたデモとしての意図的な省略。gateway 側にもサーバ照合が無い)。HTML に埋め込むトークン由来の値はすべてエスケープする。
+ステータスコード: `code` あり 200、`error` パラメータあり 400 (認可失敗ページに `error` / `error_description` / `state` を表示し、トークン取得は行わない)、`code` も `error` も無い 400。`POST /callback` (旧 form_post 受信) は削除。HTML に埋め込むクエリ由来の値はすべてエスケープする。
+
+`scope` の `openid` は残す。OIDC ではないので不要だが、gateway の既存 `/authorize` が要求している可能性があり、そこは rp の担当範囲外だから。`response_mode` と `nonce` は付けない。
+
+### インライン JS の責務 (第 14.1 節 step 9〜13)
+
+1. `state` を `sessionStorage` の値と照合 (不一致・未保存は失敗表示、`/token` は呼ばない)。
+2. IndexedDB の鍵で DPoP proof を作る。ヘッダ `{typ:"dpop+jwt", alg:"EdDSA", jwk:{kty,crv,x}}`、
+   ペイロード `{jti:<128bit base64url>, htm:"POST", htu:"<ISSUER>/token", iat}`、
+   `crypto.subtle.sign("Ed25519", key, ASCII(header.payload))`。base64url は自前。`jti` は毎回新しい値。
+3. `POST <ISSUER>/token`、`Content-Type: application/x-www-form-urlencoded`、`DPoP: <proof>`、
+   本体 `grant_type=authorization_code&code=<アサーション JWT>&client_id&redirect_uri`。非 2xx は `{error, error_description}` を表示。
+   rp はアサーションを検証しない (グループ公開鍵を持たない)。検証は gateway とノードが行う。
+4. `GET <ISSUER>/jwks.json` → `kid` で鍵を選び `importKey("jwk", {kty:"OKP",crv:"Ed25519",x}, {name:"Ed25519"}, false, ["verify"])` → `verify`。
+5. 検証は順に `typ === "at+jwt"`、`alg === "EdDSA"`、Ed25519 署名、`iss`、`aud` に `client_id`、`exp` 未経過、`cnf.jkt` === 自鍵の jkt。最初の失敗で停止し、1 項目ずつ ✓ / ✖ を表示。
+6. 表示: access_token 全文、`token_type` / `expires_in` / `scope`、`refresh_token` 先頭 8 文字、自鍵の jkt、検証結果、クレーム JSON。
+7. リフレッシュボタン: `grant_type=refresh_token&refresh_token=…` を **新しい proof** で送り、表示を更新する (refresh_token はローテーションされる前提で保持値を差し替える)。
+8. 外部由来の値は例外なく `textContent` で描画する (`innerHTML` / `outerHTML` / `insertAdjacentHTML` / `document.write` を使わない)。
+
+`/token` と `/jwks.json` はクロスオリジンで呼ばれる。`DPoP` は単純ヘッダではないので、gateway の
+プリフライト応答の `Access-Control-Allow-Headers` に `DPoP` と `Content-Type` が必要 (第 14.4 節)。
 
 ### 完了条件
 
-- コンポーネント e2e: vitest 内でフェイク JWKS サーバ (テストが `node:crypto` で作った Ed25519 鍵) と rp をポート 0 で起動し、正しい JWT で成功表示、改竄 / `iss` 不一致 / 期限切れ / 未知 `kid` で失敗表示になること。
+- **インライン JS の実行テスト** (ブラウザが無い環境での実動確認の代替): `new Function` で
+  `TOKEN_SCRIPT` / `DPOP_SCRIPT` を取り出し、Node の WebCrypto (`globalThis.crypto.subtle`) で実行する。
+  (a) 自前鍵で作った proof を `node:crypto` の `crypto.verify` で検証できる、
+  (b) テストが `node:crypto` の Ed25519 鍵で署名したアクセストークン (`typ: at+jwt`、`cnf.jkt` = proof 鍵の jkt) を
+  検証関数が受理し、改竄 / 別鍵署名 / `iss` 違い / `aud` 違い / `cnf.jkt` 違い / 期限切れ / `typ` 違い / 未知 `kid` を拒否する。
+- **結合テスト**: IndexedDB と `fetch` を差し替え可能な引数にし、フェイク gateway の HTTP サーバ (ポート 0、
+  `/token` が `DPoP` ヘッダと `grant_type` と proof 署名を検査して proof 鍵の jkt に束縛したトークンを返す、`/jwks.json`) に対し
+  フロー関数を Node で実行して、成功パス・リフレッシュ・`/token` 400 パス・proof 欠落パスを確認する。
+  `code` はアサーション JWT を渡し、長い JWT がフォーム本体でバイト単位に保たれることを確認する
+  (フェイク gateway は 3 分割の JWT 形かだけを見る。中身の検証は本物の gateway とノードの仕事)。
+- HTML: `/` の authorize URL に `response_type=code` と `dpop_jkt` 組み立て JS があること、
+  `/callback?code&state` が 200 で `data-code` / `data-state` / `data-issuer` を含みエスケープされること、
+  `code` 欠落 400、`error=access_denied` で失敗表示、300 バイト超のアサーション JWT が `data-code` にそのまま入りクレームが HTML に漏れないこと。
 - Docker: `docker build projects/rp/` 成功、`/health` と `/` が 200。
+- **ブラウザでしか確かめられない部分** (IndexedDB の永続化、DOM 描画、CORS プリフライト、`sessionStorage`) は
+  README に「未検証」として明記する。
 
 ## 8. docker-compose (最終ステップ)
 
@@ -303,11 +343,9 @@ node dist/index.js --out <dir> [--threshold 2] [--total 3] [--key-id pasta-group
 [gateway] rp-demo   ← id_token eyJhbGci  → Ed25519 ✓  (demo-only callback page)
 [gateway] ✖ sign-on rejected: quorum 1 < 2 (node2, node3 unreachable)
 
-[rp]      ● up      issuer=http://localhost:3000   holds: JWKS(kid) only   never: pw, A, B_i, ct_i, any node traffic
-[rp]      landing   nonce=NcRe02V2abc state=O4QDuujD0Av6  → authorize URL
-[rp]      callback  state=fmt-1  ← id_token eyJhbGci (direct from browser, not via gateway)
-[rp]                JWKS kid=pasta-group-key-1 → Ed25519 ✓  iss ✓  aud ✓  exp 3598s  sub=usr_alice_12345
-[rp]      ✖ callback rejected: Ed25519 signature verification failed
+[rp]      ● up      issuer=http://localhost:3000   holds: (HTML only)   never: pw, tokens, keys, any node traffic
+[rp]      landing   state=O4QDuujD0Av6  → authorize URL (response_type=code, dpop_jkt)
+[rp]      callback  state=fmt-1  ← code(assertion) eyJhbGci (query, via browser redirect)  → page with token script
 
 [browser] sign-on   user=alice nonce=fmt-1  → r 02cd2de7  A=r·H1(pw) eMKDHfR7  jkt Rupx_EC1  nonce_s 9UAuty0I
 [browser]           ← B_i×3 ct_i×3 (D,E)×3  sess=d61a8b11
@@ -410,3 +448,112 @@ gateway / gateway フロント (デモ UI) / node には公開鍵のサムプリ
 
 DPoP 秘密鍵は rp フロントから出ない。gateway、gateway フロント、node が知るのは jkt だけで、
 id_token の `cnf.jkt` は最初から rp の鍵に束縛される。
+
+## 14. OAuth 化: ステートレス認可コード (code = 認証アサーション) と /token
+
+決定 (2026-09-06/07):
+- スコープは OAuth 2.0 (RFC 6749 authorization code) + DPoP (RFC 9449)。OIDC の id_token は **廃止**。
+- PASTA の役割は「パスワードを知る者だけが作れる **認証アサーション** (ノードのグループ署名付き JWT) を生成する」ことに限定。
+- **認可コードはアサーション JWT そのもの** (ステートレス)。RFC 6749 は code を不透明文字列とだけ定め、構造は規定しないので JWT でよい。
+  gateway は authorize セッションや code ストアを **持たない**。node もセッション記録を **持たない**。
+- アクセストークンは、node が「アサーション + rp の DPoP proof」を **自分で検証** して署名シェアを平文で返し、gateway が合成する。
+  初回もリフレッシュも同じ `/token`。gateway が唯一持つ状態は refresh_token → {sub, jkt, client_id, scope} の対応 (ローテーション) のみ。
+- リプレイ保護: アサーションの `exp` を発行から **30 秒** に制限。リプレイで得られるトークンも同じ `cnf.jkt` に束縛され rp の
+  DPoP 秘密鍵無しでは行使できないため、node は jti 記録などの状態を持たない (窓の短さで足りる)。
+- rs_i / rk_i / ctr / `/authenticate` / node のセッション記録は存在しない。
+
+### 14.1 フロー
+
+```
+【認可: PASTA でアサーション (=code) を作る】
+1. rp フロント                  保管済み DPoP 鍵の jkt を用意 (第 13 節)
+2. rp フロント → gateway        GET /authorize?response_type=code&client_id&redirect_uri&scope&state&dpop_jkt
+   gateway                      パラメータを検証するだけ (状態は保存しない)。dpop_jkt/client_id/redirect_uri/scope/state/チャレンジ c を
+                                /demo の URL に載せて引き継ぐ。c = 乱数 (アサーションの nonce になる。gateway は保存しない)
+   gateway → rp フロント        /demo?c&dpop_jkt&client_id&redirect_uri&scope&state へリダイレクト
+3. IdP フロント                 username, password 入力。r, A = r·H1(pw)
+4. IdP フロント → gateway       POST /api/pasta/sign-on {username, A, sessionNonce, cnfJkt=dpop_jkt, nonce=c, clientId, scope, aud=ISSUER, iat, exp(≤30s)}
+5. gateway → node×3             /commit → /sign-on (中継。gateway は状態を持たない)
+   node                         署名対象 = アサーション {iss, sub(ユーザー記録から), aud=ISSUER, cnf:{jkt}, nonce=c, client_id, scope, iat, exp}
+                                exp - iat ≤ 30 を検証。B_i, z_i, ct_i=AEAD_{h_i}(z_i)。**セッション記録は作らない**
+   node → gateway → IdP フロント {B_i, ct_i, sub, (D,E)}
+6. IdP フロント                 h → ct_i 復号 → σ 合成 → アサーション JWT = header.payload.σ。password 相違ならここで失敗
+7. IdP フロント → rp            redirect_uri?code=<アサーション JWT>&state=<state> へ遷移 (GET)。gateway/node を経由しない
+                                ※ /authorize/complete は無い。ページが rp 側に戻る
+
+【発行: node がアサーションと DPoP proof を検証して署名】
+8.  rp → rp フロント            GET /callback?code&state の HTML。インライン JS が続きを行う
+9.  rp フロント → gateway       POST /token {grant_type=authorization_code, code=<アサーション>, client_id, redirect_uri}
+                                ヘッダ DPoP: <proof (htm=POST, htu=<ISSUER>/token, jti, iat)>   ※ CORS 越し
+    gateway                     code=アサーションをそのまま node に渡す。proof の jwk サムプリント = アサーションの cnf.jkt を確認 (二重防御)
+10. gateway → node×3            /commit → /sign {assertion, dpopProof, iat, exp, jti}
+    node                        検証: アサーションのグループ署名、aud=ISSUER、exp 未経過 (30 秒窓)、
+                                verifyDPoPProof(proof, POST, <自設定 ISSUER>/token, assertion.cnf.jkt)、proof.iat 鮮度、exp-iat ≤ 3600
+                                署名対象 = アクセストークン {iss, sub: assertion.sub, aud: assertion.client_id, scope: assertion.scope,
+                                cnf:{jkt: assertion.cnf.jkt}, iat, exp, jti}、ヘッダ {alg:EdDSA, typ:"at+jwt", kid}
+    node                        access_token に加え **refresh_token** {iss, sub, cnf:{jkt}, client_id, scope, typ:"refresh+jwt", iat, exp(長め)} にも署名
+    node → gateway              access_token の z_i と refresh_token の z_i (どちらも **平文**)
+11. gateway                     access_token と refresh_token の z_i をそれぞれ合成 → 2 つの JWT。gateway は状態を持たない
+    gateway → rp フロント       {access_token, token_type:"DPoP", expires_in, refresh_token(=node 署名付き JWT), scope}
+12. rp フロント → gateway       GET /jwks.json (CORS)。WebCrypto で署名・iss・aud・exp・cnf.jkt を検証して表示
+
+【リフレッシュ: node 署名付き refresh_token を使う。gateway 状態なし】
+13. rp フロント → gateway       POST /token {grant_type=refresh_token, refresh_token=<node 署名付き JWT>} + 新 DPoP proof
+    gateway                      refresh_token と proof をそのまま node へ中継 (gateway は refresh_token を保持も検証もしない。cnf.jkt 一致のみ確認)
+14. gateway → node×3            /commit → /sign {refreshToken, dpopProof, claims:{iat,exp,jti}}
+    node                         検証: refresh_token のグループ署名、typ="refresh+jwt"、exp 未経過、proof の鍵 = refresh_token.cnf.jkt、htu/htm/iat
+                                 → access_token の z_i と **新しい refresh_token の z_i** の両方を平文で返す
+15. gateway                      両方を合成 → 新 access_token + 新 refresh_token を rp フロントへ。IdP フロントは不関与
+```
+
+### 14.2 gateway が保持するもの: 無し (完全ステートレス)
+
+gateway はいかなるユーザー状態も持たない。authorize セッション、code ストア、refresh_token ストア、sub、アサーション、jti、認証状態のいずれも保持しない。
+- **refresh_token はノードのグループ署名付き JWT** (`typ:"refresh+jwt"`) であり、gateway ではなく **node のみが発行できる**。gateway は素通しする。
+- gateway が行うのは、`/token` で受け取った code(=assertion) または refresh_token と DPoP proof をそのまま node に中継し、返った z_i を合成すること。
+  gateway の検証は「proof の jwk サムプリント = トークン (assertion / refresh_token) の cnf.jkt」の一致確認のみ (node も検証する二重防御)。
+- 合成した access_token / refresh_token はログに出してよい (どちらも cnf.jkt に束縛され rp の DPoP 秘密鍵無しには使えない)。
+
+### 14.3 node が検証するもの (状態なし)
+
+- `/sign-on`: 変更なし + アサーション payload に `client_id`, `scope`, `nonce=c` を載せ、`exp - iat ≤ 30` を検証。sub はユーザー記録から。セッション記録は作らない。
+- `/sign`: アサーションのグループ署名、`aud=ISSUER`、`exp` 未経過 (30 秒窓)、DPoP proof (署名・`jkt`=assertion.cnf.jkt・`htu`=自設定 ISSUER+"/token"・`htm`=POST・`iat` 鮮度)、access token の `exp-iat ≤ 3600`。**jti は記録しない**。sub/aud/scope/cnf.jkt はアサーションから取り gateway 指定は無視。
+- `/sign` (refresh grant): `refreshToken` のグループ署名、`typ="refresh+jwt"`、`exp` 未経過、DPoP proof (署名・`jkt`=refreshToken.cnf.jkt・`htu`・`htm`・`iat`)。
+  sub/client_id/scope/cnf.jkt は refresh_token から取る。access_token と **新 refresh_token** の両方に署名して返す (2 つの署名対象)。
+- **refresh_token の署名対象** = `{iss, sub, cnf:{jkt}, client_id, scope, iat, exp}`、ヘッダ `{alg:"EdDSA", typ:"refresh+jwt", kid}`。node のグループ鍵でのみ作れる。
+- **トークンの失効は exp に委ねる (設計上の帰結)**。この分散構成には失効を問い合わせる単一の権威が無い。gateway を権威にすれば集権が復活し、node で jti 失効を効かせるにはノード間コンセンサスが必要で too much。
+  よって access_token / refresh_token とも exp まで有効とし、途中失効はしない。refresh 時に新トークンを出す (ローテーション) が旧トークンは無効化しない (exp まで有効)。
+  盗難対策は失効ではなく **DPoP の cnf.jkt 束縛** が担う (rp の秘密鍵無しには行使不可)。access_token は短命 (例 1h)、refresh_token は長め (例 30 日)。
+- node は `ISSUER` を環境変数で持ち `htu`・`aud` の期待値を自分で計算。`/authenticate` は無い。node は一切のセッション状態を持たない。
+
+### 14.4 コンポーネント別
+
+- **node**: `protocol/node.ts` 凍結解除。`NodeSessionRecord`/`handleRefresh`/`getSession`/`rs_i`/`ctr` を削除、セッション状態を持たない。
+  `handleSignOn` の署名対象をアサーション形 (client_id, scope, nonce, exp≤30s) に、ct_i は z_i のみ。`handleSign(roundId, {assertion, dpopProof,
+  iat, exp, jti}, ownCommitment)` を追加。HTTP `/sign` 追加、`/refresh` 削除。config に `ISSUER`。デモログ `sign` 行 (← assertion σ ✓ DPoP ✓ → z_i 平文)。暗号関数 (`crypto/*`, `client-sdk/dpop.ts`, `jwt/jwt.ts`) は凍結のまま。
+- **gateway**: `/authorize` (response_type=code、状態を保存せず c 付きで /demo へ)、`/token` (両 grant、DPoP 検証、code=アサーションを node に中継、
+  合成、refresh_token ローテーション、CORS: `/token`(POST, DPoP+Content-Type) と `/jwks.json`(GET) に `RP_ORIGIN` 既定 `http://localhost:3001`)。
+  `/authorize/complete` は無い。`/api/pasta/sign-on` は残す (アサーション用、Wire に clientId/scope 追加)。`/api/pasta/refresh`・`/demo/rp-callback`・
+  `form-post.ts` 利用を削除。`oidc.ts` discovery を `response_types_supported:["code"]`, `grant_types_supported`, `dpop_signing_alg_values_supported:["EdDSA"]`,
+  `token_endpoint` に更新。デモログ `token` 行に `→ access_token <先頭16> (cnf.jkt=…)` を許容。
+- **IdP フロント (projects/demo)**: SDK 出力を id_token→アサーション (client_id, scope, nonce=c, exp≤30s)。`refresh()` 削除。`App.tsx`:
+  URL の `c`, `dpop_jkt`, `client_id`, `redirect_uri`, `scope`, `state` を読み、sign-on → アサーション取得 → `redirect_uri?code=<アサーション>&state=` へ遷移。
+  JWT タブは「assertion」表示。CLI スタンドイン: rp フロント役として `/authorize`→sign-on→code(アサーション)→`/token`(自前 DPoP 鍵)→access_token を stdout 最終行に。`--refresh` で refresh_token grant。
+- **rp**: Node サーバーは **HTML 配信のみ**。`GET /` は response_type=code の authorize URL。`GET /callback?code&state` は HTML を返すだけ
+  (サーバは `/token` を呼ばない)。**サーバ側検証 (`jwt.ts`, `jwks.ts`, `POST /callback` 受信) を削除**、`IDP_INTERNAL_URL` 削除。コールバックの
+  インライン JS が IndexedDB の鍵で DPoP proof を作り `/token` を呼び、gateway の `/jwks.json` を fetch して WebCrypto (Ed25519) で
+  access_token を検証 (署名, iss, aud, exp, cnf.jkt=自鍵) して表示、リフレッシュボタンも。全て `textContent`。ランタイム依存ゼロ維持。
+- **総合テスト**: CLI で authorize→sign-on→code(アサーション)→`/token`→access_token を `node:crypto` で JWKS 検証、`cnf.jkt` 一致、`typ=at+jwt`、
+  `/token` を proof 無しで 400、他人の鍵の proof で 400、アサーション改竄で 400、30 秒より古いアサーションで 400、refresh_token grant 成功と
+  旧 refresh_token の無効化、誤パスワードでアサーションが作れない (code に至らない)、node ログに `sign`、gateway ログに access_token (許容) だが
+  パスワード非出力。
+- **廃止**: id_token、`/demo/rp-callback`、`/api/pasta/refresh`、`/authorize/complete`、rs_i/rk_i/ctr、node のセッション記録、rp の form_post 受信・サーバ検証。
+
+### 14.5 成立する性質
+
+- パスワードを知らなければアサーション (=code) を作れない → 認可コードもアクセストークンも出ない。
+- rp の DPoP 秘密鍵が無ければ node は署名しない → gateway 単独では発行できない。**gateway はユーザー状態を一切持たない** (refresh_token も node 署名付き JWT で gateway は素通し)。
+- refresh_token は node のグループ署名でのみ作れる。それを保持していること自体が「過去に PASTA 認証を経てアクセストークンを発行した」証明になり、DPoP で cnf.jkt に束縛されるため第三者は行使できない。
+- アサーションのリプレイは可能だが、得られるトークンは rp の cnf.jkt に束縛され行使できない。窓は 30 秒。
+- gateway が見るのは z_i (ノンスでマスク) と完成トークン (cnf.jkt 束縛) のみ。パスワード・h・h_i・鍵シェアは見ない。
+- アクセストークンは PASTA トークンではない。PASTA の保証は認証アサーションに対して成立する。
