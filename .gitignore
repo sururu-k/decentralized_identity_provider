@@ -1,15 +1,7 @@
 # ---- Node.js / TypeScript ----
 node_modules/
 dist/
-demo/node_modules/
 .npm/
-
-# ---- Rust / Cargo ----
-/target/
-**/*.rs.bk
-*.pdb
-
-# Cargo.lock はバイナリクレートなのでコミットする（意図的に ignore しない）
 
 # ---- 鍵・秘密情報 ----
 # MPC/暗号実装のため、鍵や共有シークレットの誤コミットを防ぐ
