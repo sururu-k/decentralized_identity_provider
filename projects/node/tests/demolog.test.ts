@@ -16,7 +16,7 @@ import {
   startNodeFromFixture,
   stopAll,
 } from "./helpers/nodes.js";
-import { signOnOverHttp } from "./helpers/client.js";
+import { signOnOverHttp, signOverHttp } from "./helpers/client.js";
 
 /**
  * The demo log of docs/container-split.md section 10: the shape of the lines, the switches
@@ -150,7 +150,7 @@ describe("demo log values", () => {
     expect(sink.lines).toEqual([
       "[node2]   sign-on   sess=3f9a12c0 round=7be1 user=alice  ← A k5Qx8vL2  (D,E)×3  " +
         "nonce_s nonce123  jkt jkt12345",
-      `${CONTINUATION_INDENT}→ B_2=k_2·A 9mZpQw3e  ct_2=AEAD_h2(z_2‖rs_2) Qw3eRt5y`,
+      `${CONTINUATION_INDENT}→ B_2=k_2·A 9mZpQw3e  ct_2=AEAD_h2(z_2) Qw3eRt5y`,
     ]);
     // The continuation starts exactly under the first line's event column.
     expect(CONTINUATION_INDENT).toHaveLength("[node2]   sign-on   ".length);
@@ -170,7 +170,7 @@ describe("demo log values", () => {
       toprfPartial: "p",
       ct: "c",
     });
-    expect(sink.lines[1]).toContain("ct_1=AEAD_h1(z_1‖rs_1) c");
+    expect(sink.lines[1]).toContain("ct_1=AEAD_h1(z_1) c");
     expect(sink.lines.join("\n")).not.toMatch(/z_1 [0-9a-zA-Z_-]/);
   });
 
@@ -190,7 +190,15 @@ describe("demo log values", () => {
       ct: "c1",
     });
     log.commit({ roundId: "r2", D: "d2", E: "e2" });
-    log.refresh({ roundId: "r3", sessionId: "s1", participants: 3, ctr: 4, ct: "c3" });
+    log.sign({
+      roundId: "r3",
+      grant: "authorization_code",
+      signature: "sig12345678",
+      jti: "jti12345678",
+      participants: 3,
+      atZ: "at_value_123",
+      rtZ: "rt_value_123",
+    });
 
     const never = sink.lines.filter((l) => l.includes("never:"));
     expect(never).toHaveLength(1);
@@ -198,7 +206,7 @@ describe("demo log values", () => {
     expect(sink.lines[0]).toBe(never[0]);
   });
 
-  it("prints the startup, commit and refresh events in the contract's shape", () => {
+  it("prints the startup, commit and sign events in the contract's shape", () => {
     const sink = capture();
     const log = createDemoLog({ nodeId: 1, total: 3, env: {}, isTty: false, write: sink.write });
 
@@ -215,10 +223,34 @@ describe("demo log values", () => {
     ]);
 
     sink.lines.length = 0;
-    log.refresh({ roundId: "r", sessionId: "3f9a12c0aa", participants: 3, ctr: 2, ct: "Qw3eRt5yxx" });
+    log.sign({
+      roundId: "8837fc27aa",
+      grant: "authorization_code",
+      signature: "SiGnAtUrExx",
+      jti: "JtIvAlUexx",
+      participants: 3,
+      atZ: "0a1b2c3d4e5f",
+      rtZ: "9f8e7d6c5b4a",
+    });
     expect(sink.lines).toEqual([
-      "[node1]   refresh   sess=3f9a12c0 round=r ctr=2  ← DPoP ✓  (D,E)×3  " +
-        "→ ct_1=AEAD_rk1(z_1) Qw3eRt5y",
+      "[node1]   sign      round=8837fc27 grant=authz  ← assertion σ SiGnAtUr ✓  " +
+        "DPoP ✓ jti JtIvAlUe  (D,E)×3  → at z_1 0a1b2c3d + rt(refresh+jwt) z_1 9f8e7d6c",
+    ]);
+
+    sink.lines.length = 0;
+    log.sign({
+      roundId: "8837fc27aa",
+      grant: "refresh_token",
+      signature: "SiGnAtUrExx",
+      jti: "JtIvAlUexx",
+      participants: 3,
+      atZ: "0a1b2c3d4e5f",
+      rtZ: "9f8e7d6c5b4a",
+    });
+    expect(sink.lines).toEqual([
+      "[node1]   sign      round=8837fc27 grant=refresh  ← refresh_token σ SiGnAtUr ✓ " +
+        "(typ=refresh+jwt)  DPoP ✓ jti JtIvAlUe  (D,E)×3  " +
+        "→ at z_1 0a1b2c3d + rt z_1 9f8e7d6c",
     ]);
   });
 
@@ -281,7 +313,7 @@ describe("demo log over HTTP", () => {
     });
     spy.mockRestore();
 
-    expect(session.id_token.split(".")).toHaveLength(3);
+    expect(session.assertion.split(".")).toHaveLength(3);
 
     const heading = logged.findIndex((l) => l.startsWith("[node1]   sign-on   sess="));
     expect(heading).toBeGreaterThanOrEqual(0);
@@ -290,7 +322,7 @@ describe("demo log over HTTP", () => {
     expect(event[0]).toContain("(D,E)×3");
     expect(event[0]).toContain("user=alice");
     expect(event[1]).toContain(`${CONTINUATION_INDENT}→ B_1=k_1·A `);
-    expect(event[1]).toContain("ct_1=AEAD_h1(z_1‖rs_1)");
+    expect(event[1]).toContain("ct_1=AEAD_h1(z_1)");
 
     // The commit event of round 1 is there too, and node 2 and 3 stay silent.
     expect(logged.some((l) => l.startsWith("[node1]   commit  "))).toBe(true);
@@ -316,9 +348,11 @@ describe("demo log over HTTP", () => {
         blinded: "AAAA",
         sessionNonce: "AAAA",
         cnfJkt: "jkt",
+        clientId: CLIENT_ID,
+        scope: "openid",
+        nonce: "c",
         iat: 1,
         exp: 2,
-        aud: CLIENT_ID,
         iss: ISSUER,
         commitments: [],
         allParticipants: [1],
@@ -330,5 +364,35 @@ describe("demo log over HTTP", () => {
     const line = logged.find((l) => l.includes("✖"));
     expect(line).toBe(`[node1]   ✖ sign-on rejected: ${res.body.error}`);
     expect(line).toContain("commitments contains no entry for node 1");
+  });
+
+  it("traces sign, without the assembled access token", async () => {
+    const session = await signOnOverHttp({
+      nodes,
+      username: "alice",
+      password: "password123",
+      clientId: CLIENT_ID,
+      issuer: ISSUER,
+      nonce: "c-demolog",
+    });
+
+    spyOnConsole();
+    const { access_token, refresh_token } = await signOverHttp({ nodes, session });
+    spy.mockRestore();
+
+    const sign = logged.find((l) => l.startsWith("[node1]   sign      "));
+    expect(sign).toContain("grant=authz");
+    expect(sign).toContain("← assertion σ ");
+    expect(sign).toContain("DPoP ✓ jti ");
+    expect(sign).toContain("(D,E)×3");
+    expect(sign).toContain("→ at z_1 ");
+    expect(sign).toContain("+ rt(refresh+jwt) z_1 ");
+
+    // The node never sees an assembled token, and never prints a whole value.
+    const all = logged.join("\n");
+    expect(all).not.toContain(access_token);
+    expect(all).not.toContain(refresh_token);
+    expect(all).not.toContain(session.assertion);
+    expect(all).not.toContain("password123");
   });
 });

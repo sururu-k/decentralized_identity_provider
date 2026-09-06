@@ -199,6 +199,42 @@ export function readPort(raw: string | undefined): number {
   return port;
 }
 
+/** Default issuer when `ISSUER` is unset or empty. */
+export const DEFAULT_ISSUER = "http://localhost:3000";
+
+/**
+ * Reads the `ISSUER` environment variable: the URL the browser sees the gateway at
+ * (docs/container-split.md section 2).
+ *
+ * The node needs it for two things it refuses to take from a request: the `iss` and `aud`
+ * of the assertion it signs, and the `htu` a DPoP proof must be bound to, which is this
+ * value plus `/token` (section 14.3). It must therefore be the same string the gateway
+ * publishes, so only an absolute `http`/`https` origin is accepted. A trailing slash is
+ * trimmed rather than refused: `http://localhost:3000/` and `http://localhost:3000` name
+ * the same issuer, and the contract asks for the second form.
+ */
+export function readIssuer(raw: string | undefined): string {
+  if (raw === undefined || raw === "") {
+    return DEFAULT_ISSUER;
+  }
+  const trimmed = raw.replace(/\/+$/, "");
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    throw new ConfigError(
+      `Invalid ISSUER ${JSON.stringify(raw)}: expected an absolute URL such as ${DEFAULT_ISSUER}`
+    );
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new ConfigError(`Invalid ISSUER ${JSON.stringify(raw)}: expected http or https`);
+  }
+  if (url.search !== "" || url.hash !== "") {
+    throw new ConfigError(`Invalid ISSUER ${JSON.stringify(raw)}: no query string or fragment`);
+  }
+  return trimmed;
+}
+
 /** Reads and validates the node config file at `path`. */
 export function loadNodeConfig(path: string): NodeConfig {
   let text: string;

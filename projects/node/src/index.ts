@@ -1,4 +1,4 @@
-import { ConfigError, loadNodeConfig, readPort } from "./config.js";
+import { ConfigError, loadNodeConfig, readIssuer, readPort } from "./config.js";
 import { createDemoLog } from "./demolog.js";
 import { IdentityNode } from "./protocol/node.js";
 import { createNodeServer } from "./server.js";
@@ -17,10 +17,16 @@ function bytesToHex(bytes: Uint8Array): string {
 function main(): void {
   const configPath = process.env.NODE_CONFIG || DEFAULT_CONFIG_PATH;
   const port = readPort(process.env.PORT);
+  const issuer = readIssuer(process.env.ISSUER);
 
   const config = loadNodeConfig(configPath);
 
-  const node = new IdentityNode(config.nodeId, config.secretKeyShare, config.groupPublicKey);
+  const node = new IdentityNode(
+    config.nodeId,
+    config.secretKeyShare,
+    config.groupPublicKey,
+    issuer
+  );
   for (const user of config.users) {
     node.registerUser(user.username, user.sub, user.toprfKeyShare, user.h_i);
   }
@@ -37,7 +43,7 @@ function main(): void {
     // gateway's JWKS, and neither the FROST share nor any h_i is logged.
     console.log(
       `[node] nodeId=${config.nodeId} threshold=${config.threshold}/${config.total} ` +
-        `users=${config.users.length} config=${configPath}`
+        `users=${config.users.length} issuer=${issuer} config=${configPath}`
     );
     console.log(`[node] groupPublicKey=${bytesToHex(config.groupPublicKey)}`);
     console.log(`[node] listening on http://0.0.0.0:${boundPort}`);

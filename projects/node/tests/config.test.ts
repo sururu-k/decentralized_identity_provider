@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import fs from "node:fs";
-import { ConfigError, DEFAULT_PORT, loadNodeConfig, parseNodeConfig, readPort } from "../src/config.js";
+import {
+  ConfigError,
+  DEFAULT_ISSUER,
+  DEFAULT_PORT,
+  loadNodeConfig,
+  parseNodeConfig,
+  readIssuer,
+  readPort,
+} from "../src/config.js";
 import { fixturePath, hexToBytes, readFixtureJson } from "./helpers/nodes.js";
 
 const NODE_1 = readFixtureJson("node-1.json");
@@ -182,5 +190,24 @@ describe("PORT parsing", () => {
 
   it("refuses a port above the 16 bit range", () => {
     expect(() => readPort("65536")).toThrowError(/1\.\.65535/);
+  });
+});
+
+describe("ISSUER", () => {
+  it("defaults when unset or empty", () => {
+    expect(readIssuer(undefined)).toBe(DEFAULT_ISSUER);
+    expect(readIssuer("")).toBe(DEFAULT_ISSUER);
+  });
+
+  it("keeps an absolute http or https origin and trims a trailing slash", () => {
+    expect(readIssuer("http://localhost:3000")).toBe("http://localhost:3000");
+    expect(readIssuer("http://localhost:3000/")).toBe("http://localhost:3000");
+    expect(readIssuer("https://idp.example.com/pasta")).toBe("https://idp.example.com/pasta");
+  });
+
+  it("refuses anything that is not a usable issuer URL", () => {
+    for (const raw of ["localhost:3000", "/relative", "ftp://host", "http://h/?a=b", "http://h/#f"]) {
+      expect(() => readIssuer(raw), `ISSUER=${JSON.stringify(raw)}`).toThrowError(ConfigError);
+    }
   });
 });

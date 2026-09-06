@@ -26,10 +26,24 @@ export function hexToBytes(hex: string): Uint8Array {
   return out;
 }
 
+/**
+ * The issuer every node in these tests is configured with, matching the `ISSUER`
+ * environment variable of the compose stack (docs/container-split.md section 2).
+ */
+export const TEST_ISSUER = "http://localhost:3000";
+
 /** Builds an `IdentityNode` from a fixture config, users already registered. */
-export function buildNodeFromFixture(name: string): { node: IdentityNode; config: NodeConfig } {
+export function buildNodeFromFixture(
+  name: string,
+  issuer: string = TEST_ISSUER
+): { node: IdentityNode; config: NodeConfig } {
   const config = loadNodeConfig(fixturePath(name));
-  const node = new IdentityNode(config.nodeId, config.secretKeyShare, config.groupPublicKey);
+  const node = new IdentityNode(
+    config.nodeId,
+    config.secretKeyShare,
+    config.groupPublicKey,
+    issuer
+  );
   for (const user of config.users) {
     node.registerUser(user.username, user.sub, user.toprfKeyShare, user.h_i);
   }
@@ -50,8 +64,12 @@ export interface RunningNode {
  * The demo log is off unless a test asks for one: three nodes tracing every round would
  * bury the test output, and only `tests/demolog.test.ts` looks at those lines.
  */
-export async function startNodeFromFixture(name: string, demoLog?: DemoLog): Promise<RunningNode> {
-  const { node, config } = buildNodeFromFixture(name);
+export async function startNodeFromFixture(
+  name: string,
+  demoLog?: DemoLog,
+  issuer: string = TEST_ISSUER
+): Promise<RunningNode> {
+  const { node, config } = buildNodeFromFixture(name, issuer);
   const server = createNodeServer(
     node,
     demoLog ?? createDemoLog({ nodeId: config.nodeId, total: config.total, env: { DEMO_LOG: "0" } })

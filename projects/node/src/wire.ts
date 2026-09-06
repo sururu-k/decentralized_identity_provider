@@ -1,22 +1,29 @@
 import { FrostCommitment } from "./crypto/frost.js";
 import { base64UrlDecode, base64UrlEncode } from "./jwt/jwt.js";
 import {
-  RefreshRequest,
-  RefreshResponse,
+  Grant,
   SignOnRequest,
   SignOnResponse,
+  SignRequest,
+  SignResponse,
+  SignRounds,
 } from "./protocol/node.js";
 
 /**
- * HTTP wire types for the node API (docs/container-split.md section 5).
+ * HTTP wire types for the node API (docs/container-split.md sections 5 and 14).
+ *
+ * There is no session on the node, so no request carries a session identifier except
+ * `/sign-on`, which only echoes it back for the gateway's own bookkeeping.
  *
  * These mirror the in-process types of `protocol/node.ts` one field at a time. The only
  * difference is the encoding contract of section 3: a `Uint8Array` never travels inside
  * JSON, so every byte string is **base64url without padding**, produced by the
  * `base64UrlEncode` / `base64UrlDecode` of `jwt/jwt.ts`.
  *
- * Fields that were already base64url strings in the in-process types (`blinded`,
- * `sessionNonce`, `toprfPartial`, `ct_i`) are carried through untouched.
+ * Fields that were already strings in the in-process types (`blinded`, `sessionNonce`,
+ * `toprfPartial`, `ct_i`, `z_i`) are carried through untouched. `z_i` is the one scalar on
+ * the wire and follows the scalar convention of section 3: 64 lowercase hex digits,
+ * big-endian, read back with `BigInt("0x" + hex)`.
  *
  * The node only ever decodes requests and encodes responses, so only those directions
  * have functions here. The opposite halves belong to the caller, and the gateway is a
@@ -49,10 +56,11 @@ export interface SignOnRequestWire {
   blinded: string;
   sessionNonce: string;
   cnfJkt: string;
+  clientId: string;
+  scope: string;
   nonce?: string;
   iat: number;
   exp: number;
-  aud: string;
   iss: string;
   commitments: CommitmentWire[];
   allParticipants: number[];
@@ -68,27 +76,42 @@ export interface SignOnResponseWire {
   sub: string;
 }
 
-/** `RefreshRequest` with `commitments[].D` / `.E` as base64url. */
-export interface RefreshRequestWire {
-  sessionId: string;
-  dpopProof: string;
-  expectedHtu: string;
-  nonce?: string;
+/** The token claims the gateway pins so all nodes sign the same bytes. */
+export interface AccessTokenClaimsWire {
   iat: number;
   exp: number;
-  aud: string;
-  iss: string;
+  jti: string;
+}
+
+/** `SignRequest` with every commitment as base64url. */
+export interface SignRequestWire {
+  grant: Grant;
+  /** `authorization_code`: the assertion assembled at sign-on, i.e. the code itself. */
+  assertion?: string;
+  /** `refresh_token`: a refresh token this group signed earlier. */
+  refreshToken?: string;
+  dpopProof: string;
+  claims: AccessTokenClaimsWire;
+  /** Optional `exp` for the new refresh token. Defaults to `claims.iat` + 30 days. */
+  refreshExp?: number;
+  /** Round-1 commitments of the access token round. */
   commitments: CommitmentWire[];
+  /** Round-1 commitments of the refresh token round. */
+  refreshCommitments: CommitmentWire[];
   allParticipants: number[];
 }
 
-/** `RefreshResponse` with `commitment.D` / `.E` as base64url. */
-export interface RefreshResponseWire {
-  nodeId: number;
+/** One signature's half of a `/sign` answer, base64url commitment and plaintext hex share. */
+export interface SignedShareWire {
   commitment: { D: string; E: string };
-  ct_i: string;
-  ctr: number;
-  sub: string;
+  z_i: string;
+}
+
+/** `SignResponse` with both commitments base64url. Both shares are plaintext hex. */
+export interface SignResponseWire {
+  nodeId: number;
+  at: SignedShareWire;
+  rt: SignedShareWire;
 }
 
 /** `POST /sign-on` request body. */
@@ -97,10 +120,17 @@ export interface SignOnEnvelopeWire {
   request: SignOnRequestWire;
 }
 
-/** `POST /refresh` request body. */
-export interface RefreshEnvelopeWire {
+/**
+ * `POST /sign` request body.
+ *
+ * Two FROST rounds, because two different messages are signed: the access token and the
+ * refresh token. They must be different rounds -- one nonce pair over two messages would
+ * leak the key share -- so the gateway calls `/commit` twice per node before `/sign`.
+ */
+export interface SignEnvelopeWire {
   roundId: string;
-  request: RefreshRequestWire;
+  refreshRoundId: string;
+  request: SignRequestWire;
 }
 
 /** `GET /health` response body. */
@@ -213,25 +243,23 @@ function commitmentPairToWire(commitment: { D: Uint8Array; E: Uint8Array }): {
 }
 
 // ---------------------------------------------------------------------------
-// Fields shared by both round-2 requests
+// Sign-on
 // ---------------------------------------------------------------------------
 
-/**
- * The token claims and FROST round-1 context that `SignOnRequest` and `RefreshRequest`
- * carry identically. Only the leading identity fields differ between the two, so this is
- * decoded once and spread into either.
- */
-type RoundFields = Pick<
-  SignOnRequest,
-  "iat" | "exp" | "aud" | "iss" | "commitments" | "allParticipants"
-> & { nonce?: string };
-
-function roundFieldsFromWire(where: string, raw: Record<string, unknown>): RoundFields {
-  const fields: RoundFields = {
-    iat: requireNumber(`${where}.iat`, raw.iat),
-    exp: requireNumber(`${where}.exp`, raw.exp),
-    aud: requireString(`${where}.aud`, raw.aud),
-    iss: requireString(`${where}.iss`, raw.iss),
+export function signOnRequestFromWire(value: unknown, where = "request"): SignOnRequest {
+  const raw = requireObject(where, value);
+  const req: SignOnRequest = {
+    sessionId: requireNonEmptyString(`${where}.sessionId`, raw.sessionId),
+    username: requireNonEmptyString(`${where}.username`, raw.username),
+    blinded: requireNonEmptyString(`${where}.blinded`, raw.blinded),
+    sessionNonce: requireNonEmptyString(`${where}.sessionNonce`, raw.sessionNonce),
+    cnfJkt: requireNonEmptyString(`${where}.cnfJkt`, raw.cnfJkt),
+    clientId: requireNonEmptyString(`${where}.clientId`, raw.clientId),
+    // An empty scope is a legitimate OAuth request, so this one may be "".
+    scope: requireString(`${where}.scope`, raw.scope),
+    iat: requireInteger(`${where}.iat`, raw.iat),
+    exp: requireInteger(`${where}.exp`, raw.exp),
+    iss: requireNonEmptyString(`${where}.iss`, raw.iss),
     commitments: commitmentsFromWire(raw.commitments, `${where}.commitments`),
     allParticipants: requireIntegerArray(`${where}.allParticipants`, raw.allParticipants),
   };
@@ -240,25 +268,9 @@ function roundFieldsFromWire(where: string, raw: Record<string, unknown>): Round
   // mentioned a nonce. A literal `null` is a caller mistake and is refused.
   const nonce = optionalString(`${where}.nonce`, raw.nonce);
   if (nonce !== undefined) {
-    fields.nonce = nonce;
+    req.nonce = nonce;
   }
-  return fields;
-}
-
-// ---------------------------------------------------------------------------
-// Sign-on
-// ---------------------------------------------------------------------------
-
-export function signOnRequestFromWire(value: unknown, where = "request"): SignOnRequest {
-  const raw = requireObject(where, value);
-  return {
-    sessionId: requireNonEmptyString(`${where}.sessionId`, raw.sessionId),
-    username: requireNonEmptyString(`${where}.username`, raw.username),
-    blinded: requireNonEmptyString(`${where}.blinded`, raw.blinded),
-    sessionNonce: requireNonEmptyString(`${where}.sessionNonce`, raw.sessionNonce),
-    cnfJkt: requireNonEmptyString(`${where}.cnfJkt`, raw.cnfJkt),
-    ...roundFieldsFromWire(where, raw),
-  };
+  return req;
 }
 
 export function signOnResponseToWire(res: SignOnResponse): SignOnResponseWire {
@@ -273,27 +285,59 @@ export function signOnResponseToWire(res: SignOnResponse): SignOnResponseWire {
 }
 
 // ---------------------------------------------------------------------------
-// Refresh
+// Sign
 // ---------------------------------------------------------------------------
 
-export function refreshRequestFromWire(value: unknown, where = "request"): RefreshRequest {
+function claimsFromWire(value: unknown, where: string): SignRequest["claims"] {
   const raw = requireObject(where, value);
   return {
-    sessionId: requireNonEmptyString(`${where}.sessionId`, raw.sessionId),
-    dpopProof: requireNonEmptyString(`${where}.dpopProof`, raw.dpopProof),
-    expectedHtu: requireNonEmptyString(`${where}.expectedHtu`, raw.expectedHtu),
-    ...roundFieldsFromWire(where, raw),
+    iat: requireInteger(`${where}.iat`, raw.iat),
+    exp: requireInteger(`${where}.exp`, raw.exp),
+    jti: requireNonEmptyString(`${where}.jti`, raw.jti),
   };
 }
 
-export function refreshResponseToWire(res: RefreshResponse): RefreshResponseWire {
-  return {
-    nodeId: res.nodeId,
-    commitment: commitmentPairToWire(res.commitment),
-    ct_i: res.ct_i,
-    ctr: res.ctr,
-    sub: res.sub,
+function grantFromWire(where: string, value: unknown): Grant {
+  const grant = requireString(where, value);
+  if (grant !== "authorization_code" && grant !== "refresh_token") {
+    throw new WireError(`${where} must be "authorization_code" or "refresh_token"`);
+  }
+  return grant;
+}
+
+export function signRequestFromWire(value: unknown, where = "request"): SignRequest {
+  const raw = requireObject(where, value);
+  const grant = grantFromWire(`${where}.grant`, raw.grant);
+  const req: SignRequest = {
+    grant,
+    dpopProof: requireNonEmptyString(`${where}.dpopProof`, raw.dpopProof),
+    claims: claimsFromWire(raw.claims, `${where}.claims`),
+    commitments: commitmentsFromWire(raw.commitments, `${where}.commitments`),
+    refreshCommitments: commitmentsFromWire(
+      raw.refreshCommitments,
+      `${where}.refreshCommitments`
+    ),
+    allParticipants: requireIntegerArray(`${where}.allParticipants`, raw.allParticipants),
   };
+  // Exactly the credential the grant names is read. The other field is ignored rather
+  // than refused, so a gateway that always sends both cannot pick which one is verified.
+  if (grant === "authorization_code") {
+    req.assertion = requireNonEmptyString(`${where}.assertion`, raw.assertion);
+  } else {
+    req.refreshToken = requireNonEmptyString(`${where}.refreshToken`, raw.refreshToken);
+  }
+  if (raw.refreshExp !== undefined) {
+    req.refreshExp = requireInteger(`${where}.refreshExp`, raw.refreshExp);
+  }
+  return req;
+}
+
+export function signResponseToWire(res: SignResponse): SignResponseWire {
+  const share = (signed: SignResponse["at"]): SignedShareWire => ({
+    commitment: commitmentPairToWire(signed.commitment),
+    z_i: signed.z_i,
+  });
+  return { nodeId: res.nodeId, at: share(res.at), rt: share(res.rt) };
 }
 
 // ---------------------------------------------------------------------------
@@ -313,10 +357,14 @@ export function signOnEnvelopeFromWire(value: unknown): { roundId: string; reque
   };
 }
 
-export function refreshEnvelopeFromWire(value: unknown): { roundId: string; request: RefreshRequest } {
+export function signEnvelopeFromWire(value: unknown): SignRounds & { request: SignRequest } {
   const raw = requireObject("body", value);
-  return {
-    roundId: requireNonEmptyString("body.roundId", raw.roundId),
-    request: refreshRequestFromWire(raw.request, "body.request"),
+  const rounds: SignRounds = {
+    accessRoundId: requireNonEmptyString("body.roundId", raw.roundId),
+    refreshRoundId: requireNonEmptyString("body.refreshRoundId", raw.refreshRoundId),
   };
+  if (rounds.accessRoundId === rounds.refreshRoundId) {
+    throw new WireError("body.refreshRoundId must differ from body.roundId");
+  }
+  return { ...rounds, request: signRequestFromWire(raw.request, "body.request") };
 }

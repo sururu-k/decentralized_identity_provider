@@ -9,8 +9,8 @@
  * Nothing here reaches into `IdentityNode`. The HTTP handler passes in the values it
  * already has on the wire, and only those: long-lived secrets (`secretKeyShare`, the TOPRF
  * key share, `h_i`) and the password never appear, not even truncated. Per-session values
- * (`A`, `B_i`, `ct_i`, `D`, `E`, `sessionNonce`) are cut to their first 8 characters, with
- * no ellipsis.
+ * (`A`, `B_i`, `ct_i`, `D`, `E`, `sessionNonce`, `z_i`, a DPoP `jti`, an assertion
+ * signature) are cut to their first 8 characters, with no ellipsis.
  */
 
 /** Where a line goes. Injectable so tests can capture instead of printing. */
@@ -37,8 +37,12 @@ export interface DemoLogOptions {
  * The `never:` text of the `● up` line. A constant on purpose (section 10): the audience
  * compares this against the other columns, so it must not move, and it is the only place
  * the claim is made — no later event repeats it.
+ *
+ * `access tokens` is on the list because of section 14: the node signs a share of one and
+ * never sees the assembled token. `sessions` is on it because the node keeps none: the
+ * assertion the client presents at `/sign` is the whole record.
  */
-export const NEVER_HELD = "pw, h, other s_i/k_i, id_token";
+export const NEVER_HELD = "pw, h, other s_i/k_i, sessions, access tokens";
 
 /** How many characters of a per-session value are shown. */
 export const VALUE_PREFIX_LENGTH = 8;
@@ -54,8 +58,9 @@ export const CONTINUATION_INDENT = " ".repeat(TAG_WIDTH + 1 + EVENT_WIDTH + 1);
  * Cuts a base64url value to its first 8 characters, with no ellipsis (section 10).
  *
  * Only ever called on values that are safe to show in part: a blinded point, a TOPRF
- * partial, a ciphertext, a commitment, a session nonce, an id. Long-term secrets are not
- * passed to this function at all, since a prefix of a key is still key material.
+ * partial, a ciphertext, a commitment, a session nonce, a masked signature share, an id.
+ * Long-term secrets are not passed to this function at all, since a prefix of a key is
+ * still key material.
  */
 export function shortValue(value: string | undefined): string {
   if (value === undefined || value === "") return "-";
@@ -127,13 +132,21 @@ export interface SignOnInfo {
   ct: string;
 }
 
-export interface RefreshInfo {
+export interface SignInfo {
+  /** The access token's round. The refresh token's round is a different one. */
   roundId: string;
-  sessionId: string;
+  /** Which credential was spent. */
+  grant: "authorization_code" | "refresh_token";
+  /** base64url of the credential's group signature, its third JWT segment. */
+  signature: string;
+  /** `jti` of the DPoP proof the node just accepted. */
+  jti: string;
+  /** Number of nodes in this round, from `allParticipants`. */
   participants: number;
-  /** The counter the node advanced to, from the response. */
-  ctr: number;
-  ct: string;
+  /** hex of the access token share. Masked by the round nonce, so a prefix is safe. */
+  atZ: string;
+  /** hex of the refresh token share. */
+  rtZ: string;
 }
 
 export interface DemoLog {
@@ -142,7 +155,7 @@ export interface DemoLog {
   startup(info: StartupInfo): void;
   commit(info: CommitInfo): void;
   signOn(info: SignOnInfo): void;
-  refresh(info: RefreshInfo): void;
+  sign(info: SignInfo): void;
   /** A refusal, printed as a single `✖` line carrying the reason verbatim. */
   reject(event: string, reason: string): void;
 }
@@ -180,7 +193,7 @@ export function createDemoLog(options: DemoLogOptions): DemoLog {
     startup: () => {},
     commit: () => {},
     signOn: () => {},
-    refresh: () => {},
+    sign: () => {},
     reject: () => {},
   };
   if (!enabled) return noop;
@@ -214,16 +227,21 @@ export function createDemoLog(options: DemoLogOptions): DemoLog {
       );
       cont(
         `→ B_${id}=k_${id}·A ${shortValue(info.toprfPartial)}  ` +
-          `ct_${id}=AEAD_h${id}(z_${id}‖rs_${id}) ${shortValue(info.ct)}`
+          `ct_${id}=AEAD_h${id}(z_${id}) ${shortValue(info.ct)}`
       );
     },
 
-    refresh(info) {
+    sign(info) {
+      const received =
+        info.grant === "authorization_code"
+          ? `← assertion σ ${shortValue(info.signature)} ✓`
+          : `← refresh_token σ ${shortValue(info.signature)} ✓ (typ=refresh+jwt)`;
       head(
-        "refresh",
-        `sess=${shortId(info.sessionId)} round=${shortId(info.roundId)} ctr=${info.ctr}  ` +
-          `← DPoP ✓  (D,E)×${info.participants}  ` +
-          `→ ct_${id}=AEAD_rk${id}(z_${id}) ${shortValue(info.ct)}`
+        "sign",
+        `round=${shortId(info.roundId)} grant=${info.grant === "authorization_code" ? "authz" : "refresh"}  ` +
+          `${received}  DPoP ✓ jti ${shortValue(info.jti)}  (D,E)×${info.participants}  ` +
+          `→ at z_${id} ${shortValue(info.atZ)} + ` +
+          `rt${info.grant === "authorization_code" ? "(refresh+jwt)" : ""} z_${id} ${shortValue(info.rtZ)}`
       );
     },
 

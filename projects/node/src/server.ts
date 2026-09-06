@@ -5,14 +5,14 @@ import { DemoLog, createDemoLog } from "./demolog.js";
 import {
   CommitResponseWire,
   HealthResponseWire,
-  RefreshResponseWire,
   SignOnResponseWire,
+  SignResponseWire,
   WireError,
   commitEnvelopeFromWire,
-  refreshEnvelopeFromWire,
-  refreshResponseToWire,
+  signEnvelopeFromWire,
   signOnEnvelopeFromWire,
   signOnResponseToWire,
+  signResponseToWire,
 } from "./wire.js";
 
 /** Largest request body the node accepts, in bytes. */
@@ -90,7 +90,7 @@ function readBody(req: http.IncomingMessage): Promise<BodyResult> {
 /**
  * Picks this node's own round-1 commitment out of the request.
  *
- * `IdentityNode.handleSignOn` / `handleRefresh` take the commitment as their third
+ * `IdentityNode.handleSignOn` / `handleSign` take the commitment as their third
  * argument; over HTTP the gateway sends the whole commitment set, so the node looks up
  * the entry carrying its own id (docs/container-split.md section 5).
  */
@@ -106,14 +106,32 @@ function ownCommitment(
 }
 
 /**
+ * The `jti` of an already accepted DPoP proof, for the demo line only.
+ *
+ * `IdentityNode` has verified the proof's signature by the time this runs, so this is a
+ * read of known-good data; anything unreadable prints as `-` rather than throwing on the
+ * success path.
+ */
+function dpopJti(proof: string): string {
+  try {
+    const payload = JSON.parse(
+      Buffer.from(proof.split(".")[1] ?? "", "base64url").toString("utf8")
+    );
+    return typeof payload?.jti === "string" ? payload.jti : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
  * Builds the node's HTTP server without binding a port, so callers (and tests) decide
  * where it listens.
  *
- * Routes (docs/container-split.md section 5):
- *   GET  /health   -> { status, nodeId, groupPublicKey }
- *   POST /commit   -> { nodeId, D, E }
- *   POST /sign-on  -> SignOnResponseWire
- *   POST /refresh  -> RefreshResponseWire
+ * Routes (docs/container-split.md sections 5 and 14):
+ *   GET  /health       -> { status, nodeId, groupPublicKey }
+ *   POST /commit       -> { nodeId, D, E }
+ *   POST /sign-on      -> SignOnResponseWire
+ *   POST /sign         -> SignResponseWire
  *
  * `demoLog` prints the compact one-or-two-line trace of docs/container-split.md section 10.
  * It is created here rather than taken from the caller so that every entry point, tests
@@ -162,7 +180,7 @@ async function handle(
     return;
   }
 
-  if (path === "/commit" || path === "/sign-on" || path === "/refresh") {
+  if (path === "/commit" || path === "/sign-on" || path === "/sign") {
     if (method !== "POST") {
       res.setHeader("Allow", "POST");
       sendError(res, 405, `Method ${method} not allowed on ${path}`);
@@ -225,24 +243,33 @@ async function handle(
         return;
       }
 
-      const { roundId, request } = refreshEnvelopeFromWire(body);
-      const commitment = ownCommitment(node.nodeId, request.commitments);
-      const out: RefreshResponseWire = refreshResponseToWire(
-        node.handleRefresh(roundId, request, commitment)
+      const { accessRoundId, refreshRoundId, request } = signEnvelopeFromWire(body);
+      const out: SignResponseWire = signResponseToWire(
+        node.handleSign({ accessRoundId, refreshRoundId }, request, {
+          access: ownCommitment(node.nodeId, request.commitments),
+          refresh: ownCommitment(node.nodeId, request.refreshCommitments),
+        })
       );
-      demo.refresh({
-        roundId,
-        sessionId: request.sessionId,
+      // Everything printed here has already been verified by `IdentityNode`: the
+      // credential's signature prefix, the proof's jti, and the two shares, each masked
+      // by its own round's FROST nonce and already on the wire.
+      const credential = request.assertion ?? request.refreshToken ?? "";
+      demo.sign({
+        roundId: accessRoundId,
+        grant: request.grant,
+        signature: credential.split(".")[2] ?? "",
+        jti: dpopJti(request.dpopProof),
         participants: request.allParticipants.length,
-        ctr: out.ctr,
-        ct: out.ct_i,
+        atZ: out.at.z_i,
+        rtZ: out.rt.z_i,
       });
       sendJson(res, 200, out);
       return;
     } catch (err) {
       // Both malformed bodies and every rejection from IdentityNode (unknown user,
-      // expired round, bad DPoP proof) are client errors. The demo log carries the
-      // rejection reason verbatim, so a refusal is visible next to the successes.
+      // spent round, unverifiable or expired credential, bad DPoP proof) are client
+      // errors. The demo log carries the rejection reason verbatim, so a refusal is
+      // visible next to the successes.
       const message = err instanceof Error ? err.message : String(err);
       demo.reject(eventName(path), message);
       sendError(res, 400, message);
