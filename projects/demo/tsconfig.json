@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    // The frozen crypto copies of docs/container-split.md section 11 must stay
+    // byte-identical to projects/gateway/src/crypto/, and toprf.ts there carries an
+    // unused `mod` import (the gateway tsconfig never enabled this check). Turning
+    // the check on would force an edit the byte freeze forbids.
+    "noUnusedLocals": false,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["src", "cli", "tests"]
+}

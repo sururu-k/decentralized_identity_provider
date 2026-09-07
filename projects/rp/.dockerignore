@@ -1,0 +1,10 @@
+node_modules
+dist
+tests
+vitest.config.ts
+npm-debug.log
+*.log
+.git
+.gitignore
+.DS_Store
+README.md
